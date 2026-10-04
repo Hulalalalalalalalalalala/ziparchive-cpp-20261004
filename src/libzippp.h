@@ -159,6 +159,7 @@ namespace libzippp {
      * content. It is simply a wrapper around libzip.
      */
     class LIBZIPPP_API ZipArchive {
+    friend class ZipEntry;
     public:
 
         /**
@@ -417,21 +418,27 @@ namespace libzippp {
          * a char array. If there is an error while reading the entry, then null will be returned.
          * The data must be deleted by the developer once not used anymore. If the asText
          * is set to true, then the returned void* will be ended by a '\0' (hence the size of
-         * the returned array will be zipEntry.getSize()+1 or size+1 if the latter is specified).
+         * the returned array will be the size of the entry in the given state plus one, or
+         * size+1 if the latter is specified and smaller).
+         * The content and its length are resolved in the given state: changes applied to the
+         * entry (replacement, deletion) after the ZipEntry was obtained are taken into account
+         * with the Current state and ignored with the Original state. If the entry does not
+         * exist in the given state, null will be returned.
          * The zip file must be open otherwise null will be returned. If the ZipEntry was not
          * created by this ZipArchive, null will be returned.
          */
         void* readEntry(const ZipEntry& zipEntry, bool asText=false, State state=Current, libzippp_uint64 size=0) const;
-        
+
         /**
          * Reads the specified ZipEntry of the ZipArchive and returns its content within
          * a char array. If there is an error while reading the entry, then null will be returned.
          * The data must be deleted by the developer once not used anymore. If the asText
          * is set to true, then the returned void* will be ended by a '\0' (hence the size of
-         * the returned array will be zipEntry.getSize()+1 or size+1 if the latter is specified).
-         * The zip file must be open otherwise null will be returned. If the ZipEntry was not
-         * created by this ZipArchive, null will be returned. If the zipEntry does not exist,
-         * this method returns nullptr:
+         * the returned array will be the size of the entry in the given state plus one, or
+         * size+1 if the latter is specified and smaller).
+         * The entry name is resolved in the given state, without falling back to the other
+         * state: if no entry with that name exists in the given state, null will be returned.
+         * The zip file must be open otherwise null will be returned.
          */
         void* readEntry(const std::string& zipEntry, bool asText=false, State state=Current, libzippp_uint64 size=0) const;
         
@@ -644,6 +651,11 @@ namespace libzippp {
         
         //generic method to create ZipEntry
         ZipEntry createEntry(struct zip_stat* stat) const;
+
+        //resolves the uncompressed size of the entry in the given state, as it is right now
+        //in the (possibly uncommitted) archive; returns false if the entry does not exist
+        //in that state (e.g. deleted in Current or newly added in Original)
+        bool getEntrySize(const ZipEntry& entry, State state, libzippp_uint64& size) const;
         
         //prevent copy across functions
         ZipArchive(const ZipArchive& zf);
@@ -770,25 +782,31 @@ namespace libzippp {
         
         /**
          * Reads the content of this ZipEntry as text.
-         * The returned string will be of size `getSize()` if the latter is not specified or too big. 
-         * If the ZipArchive is not open, this method returns an
-         * empty string. This method is a wrapper around ZipArchive::readEntry(...).
+         * The returned string will be of the size of the entry in the given state (which may
+         * differ from getSize() if the entry was modified since this ZipEntry was obtained)
+         * if the size argument is not specified or too big.
+         * If the ZipArchive is not open or the entry does not exist in the given state, this
+         * method returns an empty string. This method is a wrapper around ZipArchive::readEntry(...).
          */
         std::string readAsText(ZipArchive::State state=ZipArchive::Current, libzippp_uint64 size=0) const;
-        
+
         /**
-         * Reads the content of this ZipEntry as binary. 
-         * The returned void* will be of size `getSize()` if the latter is not specified or too big.
-         * If the ZipArchive is not open, this method returns nullptr.
+         * Reads the content of this ZipEntry as binary.
+         * The returned void* will be of the size of the entry in the given state if the latter
+         * is not specified or too big.
+         * If the ZipArchive is not open or the entry does not exist in the given state, this
+         * method returns nullptr.
          * The data must be deleted by the developer once not used anymore.
          * This method is a wrapper around ZipArchive::readEntry(...).
          */
         libzippp_uint8* readAsBinary(ZipArchive::State state=ZipArchive::Current, libzippp_uint64 size=0) const;
 
         /**
-         * Reads the content of this ZipEntry as binary string. 
-         * The returned string will be of size `getSize()` if the latter is not specified or too big.
-         * If the ZipArchive is not open, this method returns nullptr.
+         * Reads the content of this ZipEntry as binary string.
+         * The returned string will be of the size of the entry in the given state if the latter
+         * is not specified or too big.
+         * If the ZipArchive is not open or the entry does not exist in the given state, this
+         * method returns an empty string.
          * This method is a wrapper around ZipArchive::readEntry(...).
          */
         std::basic_string<libzippp_uint8> readAsBinaryString(ZipArchive::State state=ZipArchive::Current, libzippp_uint64 size=0) const;
