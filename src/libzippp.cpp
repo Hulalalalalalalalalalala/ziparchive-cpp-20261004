@@ -159,10 +159,14 @@ bool ZipEntry::setCompressionLevel(libzippp_uint32 level) {
 
 string ZipEntry::readAsText(ZipArchive::State state, libzippp_uint64 size) const {
     char* content = (char*)zipFile->readEntry(*this, true, state, size);
-    if (content==nullptr) { return string(); } //happen if the ZipArchive has been closed
+    if (content==nullptr) { return string(); } //happen if the ZipArchive has been closed or the entry does not exist in the state
 
-    libzippp_uint64 maxSize = getSize();
-    string str(content, (size==0 || size>maxSize ? maxSize : size));
+    //the read length is computed from the entry AS IT IS IN THE REQUESTED STATE instead of
+    //from the size captured when this object was obtained: a replacement may be longer,
+    //shorter or empty and the object is not required to be fetched again to read it
+    libzippp_uint64 maxSize = zipFile->getEntry((libzippp_int64)index, state).getSize();
+    libzippp_uint64 length = size==0 || size>maxSize ? maxSize : size;
+    string str(content, length); //the extra '\0' appended by readEntry is not part of the content
     delete[] content;
     return str;
 }
@@ -173,10 +177,13 @@ libzippp_uint8* ZipEntry::readAsBinary(ZipArchive::State state, libzippp_uint64 
 
 basic_string<libzippp_uint8> ZipEntry::readAsBinaryString(ZipArchive::State state, libzippp_uint64 size) const {
     libzippp_uint8* content = (libzippp_uint8*)zipFile->readEntry(*this, true, state, size);
-    if (content==nullptr) { return basic_string<libzippp_uint8>(); } //happen if the ZipArchive has been closed
+    if (content==nullptr) { return basic_string<libzippp_uint8>(); } //happen if the ZipArchive has been closed or the entry does not exist in the state
 
-    libzippp_uint64 maxSize = getSize();
-    basic_string<libzippp_uint8> str(content, (size==0 || size>maxSize ? maxSize : size));
+    //see readAsText: the length must reflect the requested state (zero bytes inside the
+    //content are preserved, the extra '\0' is only an allocation artifact)
+    libzippp_uint64 maxSize = zipFile->getEntry((libzippp_int64)index, state).getSize();
+    libzippp_uint64 length = size==0 || size>maxSize ? maxSize : size;
+    basic_string<libzippp_uint8> str(content, length);
     delete[] content;
     return str;
 }
@@ -569,6 +576,30 @@ ZipEntry ZipArchive::createEntry(struct zip_stat* stat) const {
     return ZipEntry(this, name, index, time, compMethod, compressionLevel, encMethod, size, sizeComp, crc);
 }
 
+int ZipArchive::stateFlags(State state) {
+    return state==Original ? LIBZIPPP_ORIGINAL_STATE_FLAGS : ZIP_FL_ENC_GUESS;
+}
+
+ZipEntry ZipArchive::resolveEntry(const ZipEntry& zipEntry, State state, libzippp_uint64* outSize) const {
+    if (outSize!=nullptr) { *outSize = 0; }
+
+    //a null-ZipEntry (e.g. obtained through getEntry in a state where the name does not
+    //exist) cannot be resolved in any state
+    if (zipEntry.isNull()) { return ZipEntry(); }
+
+    int flag = stateFlags(state);
+    struct zip_stat stat;
+    zip_stat_init(&stat);
+
+    //stat the (stable) slot in the requested state: this fails for an entry deleted in the
+    //current state (read with Current) or a newly added entry (read with Original)
+    if (zip_stat_index(zipHandle, zipEntry.getIndex(), flag, &stat)!=0) { return ZipEntry(); }
+
+    ZipEntry resolved = createEntry(&stat);
+    if (outSize!=nullptr) { *outSize = stat.size; }
+    return resolved;
+}
+
 vector<ZipEntry> ZipArchive::getEntries(State state) const {
     if (!isOpen()) { return vector<ZipEntry>(); }
 
@@ -613,9 +644,12 @@ ZipEntry ZipArchive::getEntry(const string& name, bool excludeDirectories, bool 
 
         libzippp_int64 index = zip_name_locate(zipHandle, name.c_str(), flags);
         if (index>=0) {
-            return getEntry(index);
+            //the located index must be stat'd in the SAME state: locating a renamed entry
+            //in the original state gives the original slot, whose name and size are the
+            //original ones (using the current stat here would return the new name/length)
+            return getEntry(index, state);
         } else {
-            //name not found
+            //name not found in the requested state
         }
     }
     return ZipEntry();
@@ -662,11 +696,19 @@ void* ZipArchive::readEntry(const ZipEntry& zipEntry, bool asText, State state, 
     if (!isOpen()) { return nullptr; }
     if (zipEntry.zipFile!=this) { return nullptr; }
 
-    int flag = state==Original ? LIBZIPPP_ORIGINAL_STATE_FLAGS : ZIP_FL_ENC_GUESS;
-    struct zip_file* zipFile = zip_fopen_index(zipHandle, zipEntry.getIndex(), flag);
+    //resolve the entry in the requested state: the uncompressed size and the existence of
+    //the entry depend on the state (a replacement may be longer, shorter or empty, a deleted
+    //entry is only readable as Original and a newly added one only as Current)
+    libzippp_uint64 entrySize = 0;
+    ZipEntry resolved = resolveEntry(zipEntry, state, &entrySize);
+    if (resolved.isNull()) { return nullptr; }
+
+    int flag = stateFlags(state);
+    struct zip_file* zipFile = zip_fopen_index(zipHandle, resolved.getIndex(), flag);
     if (zipFile) {
-        libzippp_uint64 maxSize = zipEntry.getSize();
-        libzippp_uint64 uisize = size==0 || size>maxSize ? maxSize : size;
+        //zero means "read the whole content" and a too big length returns all of it; the
+        //captured zipEntry size is intentionally never used to bound the read
+        libzippp_uint64 uisize = size==0 || size>entrySize ? entrySize : size;
 
         char* data = NEW_CHAR_ARRAY(uisize+(asText ? 1 : 0))
         if (!data) { //allocation error
@@ -687,14 +729,16 @@ void* ZipArchive::readEntry(const ZipEntry& zipEntry, bool asText, State state, 
             delete[] data;
         }
     } else {
-        //unable to read the entry => crash ?
+        //unable to read the entry (e.g. it does not exist in the requested state) => crash ?
     }
 
     return nullptr;
 }
 
 void* ZipArchive::readEntry(const string& zipEntry, bool asText, State state, libzippp_uint64 size) const {
-    ZipEntry entry = getEntry(zipEntry);
+    //the name is interpreted in the requested state: there is no fallback to the other state
+    //if the name does not exist in this one
+    ZipEntry entry = getEntry(zipEntry, false, true, state);
     if (entry.isNull()) { return nullptr; }
     return readEntry(entry, asText, state, size);
 }
@@ -1051,89 +1095,61 @@ int ZipArchive::readEntry(const ZipEntry& zipEntry, std::function<bool(const voi
     if (!isOpen()) { return LIBZIPPP_ERROR_NOT_OPEN; }
     if (zipEntry.zipFile!=this) { return LIBZIPPP_ERROR_INVALID_ENTRY; }
 
+    //resolve the entry in the requested state: its existence and uncompressed size depend
+    //on the state. When it does not exist in the state, no data is delivered at all.
+    libzippp_uint64 maxSize = 0;
+    ZipEntry resolved = resolveEntry(zipEntry, state, &maxSize);
+    if (resolved.isNull()) { return LIBZIPPP_ERROR_FOPEN_FAILURE; }
+
+    if (!chunksize) { chunksize = LIBZIPPP_DEFAULT_CHUNK_SIZE; } // use the default chunk size (512K) if not specified by the user
+
+    int flag = stateFlags(state);
+    struct zip_file* zipFile = zip_fopen_index(zipHandle, resolved.getIndex(), flag);
+    if (!zipFile) { return LIBZIPPP_ERROR_FOPEN_FAILURE; }
+
     int iRes = LIBZIPPP_OK;
-    int flag = state==Original ? LIBZIPPP_ORIGINAL_STATE_FLAGS : ZIP_FL_ENC_GUESS;
-    struct zip_file* zipFile = zip_fopen_index(zipHandle, zipEntry.getIndex(), flag);
-    if (zipFile) {
-        libzippp_uint64 maxSize = zipEntry.getSize();
-        if (!chunksize) { chunksize = LIBZIPPP_DEFAULT_CHUNK_SIZE; } // use the default chunk size (512K) if not specified by the user
 
-        if (maxSize<chunksize) {
-            char* data = NEW_CHAR_ARRAY(maxSize)
-            if (data!=nullptr) {
-                libzippp_int64 result = zip_fread(zipFile, data, maxSize);
-                if (result>=0) {
-                    if (result != static_cast<libzippp_int64>(maxSize)) {
-                        iRes = LIBZIPPP_ERROR_OWRITE_INDEX_FAILURE;
-                    } else if (!writeFunc(data, maxSize)) {
-                        iRes = LIBZIPPP_ERROR_OWRITE_FAILURE;
-                    }
-                } else {
-                    iRes = LIBZIPPP_ERROR_FREAD_FAILURE;
-                }
-                delete[] data;
-            } else {
-                iRes = LIBZIPPP_ERROR_MEMORY_ALLOCATION;
-            }
-        } else {
-            libzippp_uint64 uWrittenBytes = 0;
-            libzippp_int64 result = 0;
-            char* data = NEW_CHAR_ARRAY(chunksize)
-            if (data!=nullptr) {
-                string::size_type nbChunks = maxSize/chunksize;
-                for (libzippp_uint32 uiChunk=0 ; uiChunk<nbChunks ; ++uiChunk) {
-                    result = zip_fread(zipFile, data, chunksize);
-                    if (result>=0) {
-                        if (result!=static_cast<libzippp_int64>(chunksize)) {
-                            iRes = LIBZIPPP_ERROR_OWRITE_INDEX_FAILURE;
-                            break;
-                        } else {
-                            if (!writeFunc(data, chunksize)) {
-                                iRes = LIBZIPPP_ERROR_OWRITE_FAILURE;
-                                break;
-                            }
-                            uWrittenBytes += result;
-                        }
-                    } else {
-                        iRes = LIBZIPPP_ERROR_FREAD_FAILURE;
-                        break;
-                    }
-                }
-                delete[] data;
-            } else {
-                iRes = LIBZIPPP_ERROR_MEMORY_ALLOCATION;
-            }
-
-            libzippp_uint64 leftOver = maxSize%chunksize;
-            if (iRes==0 && leftOver>0) {
-                char* data = NEW_CHAR_ARRAY(leftOver);
-                if (data!=nullptr) {
-                    result = zip_fread(zipFile, data, leftOver);
-                    if (result>=0) {
-                        if (result!=static_cast<libzippp_int64>(leftOver)) {
-                            iRes = LIBZIPPP_ERROR_OWRITE_INDEX_FAILURE;
-                        } else {
-                            if (!writeFunc(data, leftOver)) {
-                                iRes = LIBZIPPP_ERROR_OWRITE_FAILURE;
-                            } else {
-                                uWrittenBytes += result;
-                                if (uWrittenBytes!=maxSize) {
-                                    iRes = LIBZIPPP_ERROR_UNKNOWN; // shouldn't occur but let's be careful
-                                }
-                            }
-                        }
-                    } else {
-                        iRes = LIBZIPPP_ERROR_FREAD_FAILURE;
-                    }
-                } else {
-                    iRes = LIBZIPPP_ERROR_MEMORY_ALLOCATION;
-                }
-                delete[] data;
-            }
+    //an empty content succeeds without reading anything; a single zero-length delivery is
+    //still signalled to the output (this matches the historical behavior)
+    if (maxSize==0) {
+        if (!writeFunc("", 0)) {
+            zip_fclose(zipFile);
+            return LIBZIPPP_ERROR_OWRITE_FAILURE;
         }
         zip_fclose(zipFile);
-    } else {
-       iRes = LIBZIPPP_ERROR_FOPEN_FAILURE;
+        return LIBZIPPP_OK;
     }
+
+    //only allocate what a single delivery may need (the whole content when it is smaller
+    //than the chunk size) instead of the chunk size in every case
+    libzippp_uint64 bufferSize = maxSize<chunksize ? maxSize : chunksize;
+    char* data = NEW_CHAR_ARRAY(bufferSize)
+    if (data!=nullptr) {
+        //stream the exact, state-resolved length in successive chunks: this delivers the
+        //whole content exactly once (chunksize bigger than, equal to, or not a divisor of
+        //the content length are all handled by the same loop)
+        libzippp_uint64 remaining = maxSize;
+        while (remaining>0) {
+            libzippp_uint64 toRead = remaining<bufferSize ? remaining : bufferSize;
+            libzippp_int64 result = zip_fread(zipFile, data, toRead);
+            if (result<0) {
+                iRes = LIBZIPPP_ERROR_FREAD_FAILURE;
+                break;
+            }
+            if (static_cast<libzippp_uint64>(result)!=toRead) {
+                iRes = LIBZIPPP_ERROR_OWRITE_INDEX_FAILURE;
+                break;
+            }
+            if (!writeFunc(data, toRead)) {
+                iRes = LIBZIPPP_ERROR_OWRITE_FAILURE;
+                break;
+            }
+            remaining -= toRead;
+        }
+        delete[] data;
+    } else {
+        iRes = LIBZIPPP_ERROR_MEMORY_ALLOCATION;
+    }
+    zip_fclose(zipFile);
     return iRes;
 }

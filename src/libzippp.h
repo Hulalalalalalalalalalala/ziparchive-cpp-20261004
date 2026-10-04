@@ -644,7 +644,23 @@ namespace libzippp {
         
         //generic method to create ZipEntry
         ZipEntry createEntry(struct zip_stat* stat) const;
-        
+
+        //converts the logical state into the flags used by libzip
+        static int stateFlags(State state);
+
+        /*
+         * Resolves the entry that must be used for the specified state.
+         * - When reading by name, the name is always interpreted in the given state:
+         *   if no entry with that name exists in that state, a null-ZipEntry is returned
+         *   (there is no fallback to the other state).
+         * - When reading an existing ZipEntry, its (stable) libzip index is stat'd in the
+         *   given state so that replaced/deleted/renamed/new entries are read consistently
+         *   with their name and uncompressed size in that state.
+         * On success the returned entry is non-null and, when outSize is not null, it is set
+         * to the uncompressed size of the entry in the given state.
+         */
+        ZipEntry resolveEntry(const ZipEntry& zipEntry, State state, libzippp_uint64* outSize) const;
+
         //prevent copy across functions
         ZipArchive(const ZipArchive& zf);
         ZipArchive& operator=(const ZipArchive&);
