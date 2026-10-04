@@ -39,6 +39,7 @@
 #include <cstdint>
 #endif
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <vector>
 #include <functional>
@@ -637,13 +638,34 @@ namespace libzippp {
 
         // User-defined error handler
         ErrorHandlerCallback* errorHandlingCallback;
-        
+
+        /*
+         * Token identifying the current open session. A new token is created each time the
+         * archive is successfully open and it is reset as soon as the session actually ends
+         * (the archive is effectively closed, discarded or destroyed). ZipEntry instances
+         * hold a weak reference to the token of the session during which they were issued:
+         * once the session is over, the reference expires and the entries become unusable,
+         * even if the same ZipArchive is open again afterwards (possibly on the same path,
+         * with identical names or indices). The weak reference never keeps the archive nor
+         * its resources alive, so retained entries do not prevent commits, discards or
+         * deletions.
+         */
+        std::shared_ptr<void> sessionToken;
+
         //open from in-memory data
         bool openBuffer(void** buffer, libzippp_uint32 sz, OpenMode mode=ReadOnly, bool checkConsistency=false);
         bool openSource(zip_source* source, OpenMode mode=ReadOnly, bool checkConsistency=false);
-        
+
         //generic method to create ZipEntry
         ZipEntry createEntry(struct zip_stat* stat) const;
+
+        /*
+         * Returns true if the entry was issued by this ZipArchive during the CURRENT open
+         * session. A null-ZipEntry, an entry created by another ZipArchive and an entry
+         * obtained during a previous open session (the archive has been closed, discarded
+         * or destroyed in between) are all rejected.
+         */
+        bool isValidEntry(const ZipEntry& entry) const;
 
         //converts the logical state into the flags used by libzip
         static int stateFlags(State state);
@@ -825,6 +847,16 @@ namespace libzippp {
         
     private:
         const ZipArchive* zipFile;
+        /*
+         * Weak reference to the token of the open session during which this entry was
+         * issued (see ZipArchive::sessionToken). The entry can only read or modify the
+         * archive while that session is still in progress; once it ends, every operation
+         * falls back to the safe null-entry behavior (empty string, nullptr, false or an
+         * error code) without touching the archive. The metadata captured when the entry
+         * was created (name, index, sizes, ...) remains queryable and isNull() is not
+         * affected by the expiration. Copies and assignments share the same session.
+         */
+        std::weak_ptr<void> sessionToken;
         std::string name;
         libzippp_uint64 index;
         time_t time;
@@ -834,9 +866,9 @@ namespace libzippp {
         libzippp_uint64 size;
         libzippp_uint64 sizeComp;
         int crc;
-        
-        ZipEntry(const ZipArchive* zipFile, const std::string& name, libzippp_uint64 index, time_t time, libzippp_uint16 compMethod, libzippp_uint32 compLevel, libzippp_uint16 encMethod, libzippp_uint64 size, libzippp_uint64 sizeComp, int crc) : 
-                zipFile(zipFile), name(name), index(index), time(time), compressionMethod(compMethod), compressionLevel(compLevel), encryptionMethod(encMethod), size(size), sizeComp(sizeComp), crc(crc) {}
+
+        ZipEntry(const ZipArchive* zipFile, const std::shared_ptr<void>& sessionToken, const std::string& name, libzippp_uint64 index, time_t time, libzippp_uint16 compMethod, libzippp_uint32 compLevel, libzippp_uint16 encMethod, libzippp_uint64 size, libzippp_uint64 sizeComp, int crc) :
+                zipFile(zipFile), sessionToken(sessionToken), name(name), index(index), time(time), compressionMethod(compMethod), compressionLevel(compLevel), encryptionMethod(encMethod), size(size), sizeComp(sizeComp), crc(crc) {}
     };
 }
 
