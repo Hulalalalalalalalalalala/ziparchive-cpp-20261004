@@ -138,14 +138,22 @@ ZipEntry::ZipEntry(void) : zipFile(nullptr), index(0), time(0), compressionMetho
 }
 
 string ZipEntry::getComment(void) const {
+    //a null entry or an entry whose opening ended (possibly because the archive itself
+    //was destroyed) must not dereference zipFile
+    if (isNull()) { return string(); }
+    if (session.expired()) { return string(); }
     return zipFile->getEntryComment(*this);
 }
 
 bool ZipEntry::setComment(const string& str) const {
+    if (isNull()) { return false; }
+    if (session.expired()) { return false; }
     return zipFile->setEntryComment(*this, str);
 }
 
 bool ZipEntry::setCompressionMethod(CompressionMethod compMethod) {
+    if (isNull()) { return false; }
+    if (session.expired()) { return false; }
     return zipFile->setEntryCompressionConfig(*this, compMethod, compressionLevel);
 }
 
@@ -154,10 +162,14 @@ CompressionMethod ZipEntry::getCompressionMethod(void) const {
 }
 
 bool ZipEntry::setCompressionLevel(libzippp_uint32 level) {
+    if (isNull()) { return false; }
+    if (session.expired()) { return false; }
     return zipFile->setEntryCompressionConfig(*this, convertCompressionFromLibzip(compressionMethod), level);
 }
 
 string ZipEntry::readAsText(ZipArchive::State state, libzippp_uint64 size) const {
+    if (isNull()) { return string(); }
+    if (session.expired()) { return string(); } //the opening this entry comes from has ended
     char* content = (char*)zipFile->readEntry(*this, true, state, size);
     if (content==nullptr) { return string(); } //happen if the ZipArchive has been closed or the entry does not exist in the state
 
@@ -172,10 +184,14 @@ string ZipEntry::readAsText(ZipArchive::State state, libzippp_uint64 size) const
 }
 
 libzippp_uint8* ZipEntry::readAsBinary(ZipArchive::State state, libzippp_uint64 size) const {
+    if (isNull()) { return nullptr; }
+    if (session.expired()) { return nullptr; }
     return (libzippp_uint8*)zipFile->readEntry(*this, false, state, size);
 }
 
 basic_string<libzippp_uint8> ZipEntry::readAsBinaryString(ZipArchive::State state, libzippp_uint64 size) const {
+    if (isNull()) { return basic_string<libzippp_uint8>(); }
+    if (session.expired()) { return basic_string<libzippp_uint8>(); }
     libzippp_uint8* content = (libzippp_uint8*)zipFile->readEntry(*this, true, state, size);
     if (content==nullptr) { return basic_string<libzippp_uint8>(); } //happen if the ZipArchive has been closed or the entry does not exist in the state
 
@@ -189,6 +205,14 @@ basic_string<libzippp_uint8> ZipEntry::readAsBinaryString(ZipArchive::State stat
 }
 
 int ZipEntry::readContent(std::ostream& ofOutput, ZipArchive::State state, libzippp_uint64 chunksize) const {
+   //an invalid stream is reported first, as for a valid entry; the error codes below
+   //are the ones guaranteed when the stream itself is valid
+   if (!ofOutput) { return LIBZIPPP_ERROR_INVALID_PARAMETER; }
+   //a null entry is invalid; a non-null entry whose opening ended is reported as coming
+   //from a no-longer-open archive. The archive object itself may have been destroyed,
+   //hence these checks must not dereference zipFile.
+   if (isNull()) { return LIBZIPPP_ERROR_INVALID_ENTRY; }
+   if (session.expired()) { return LIBZIPPP_ERROR_NOT_OPEN; }
    return zipFile->readEntry(*this, ofOutput, state, chunksize);
 }
 
@@ -215,8 +239,31 @@ ZipArchive::ZipArchive(const string& zipPath, const string& password, Encryption
     }
 }
 
+void ZipArchive::beginEntrySession(void) {
+    entrySession = std::make_shared<ZipEntrySession>();
+}
+
+void ZipArchive::endEntrySession(void) {
+    //releasing the last strong reference expires every weak_ptr held by the entries
+    //obtained during this opening, including all their copies
+    entrySession.reset();
+}
+
+bool ZipArchive::isEntryUsable(const ZipEntry& entry) const {
+    if (entry.isNull()) { return false; }
+    if (entry.zipFile!=this) { return false; }
+    //the entry must belong to the CURRENT opening of this archive: its session marker
+    //is the one this archive holds right now
+    std::shared_ptr<ZipEntrySession> entryOpening = entry.session.lock();
+    return entryOpening && entryOpening==entrySession;
+}
+
 ZipArchive::~ZipArchive(void) {
     close(); /* discard ??? */
+
+    //whatever close() did (including a failed commit), the archive object itself is
+    //gone: every entry obtained from any opening must be expired now
+    endEntrySession();
 
     // ensures all the values are clared
     zipHandle = nullptr;
@@ -327,6 +374,7 @@ bool ZipArchive::openSource(zip_source* source, OpenMode om, bool checkConsisten
 #endif
 
     mode = om;
+    beginEntrySession(); //entries created by this opening share this marker
     return true;
 }
 
@@ -369,6 +417,7 @@ bool ZipArchive::open(OpenMode om, bool checkConsistency) {
 #endif
 
         mode = om;
+        beginEntrySession(); //entries created by this opening share this marker
         return true;
     }
 
@@ -413,11 +462,16 @@ int ZipArchive::close(void) {
 
         int result = zip_close(zipHandle);
         if (result!=0) {
+            //typically a cancelled commit: the archive is still open and usable, the
+            //session is left untouched so existing entries and their copies remain valid
             Helper::callErrorHandlingCallback(zipHandle, "unable to close archive: %s\n", errorHandlingCallback);
             return LIBZIPPP_ERROR_HANDLE_FAILURE;
         }
 
         zipHandle = nullptr;
+        //the opening really ended (even if the buffer readback below fails afterwards):
+        //all entries obtained during it must expire now
+        endEntrySession();
         progress_callback(zipHandle, 1, this); //enforce the last progression call to be one
 
         //push back the changes in the buffer
@@ -505,6 +559,7 @@ void ZipArchive::discard(void) {
         }
 
         mode = NotOpen;
+        endEntrySession(); //discarded opening: all its entries expire
     }
 }
 
@@ -539,7 +594,7 @@ bool ZipArchive::setComment(const string& comment) const {
 
 bool ZipArchive::setEntryCompressionConfig(ZipEntry& entry, CompressionMethod comp, libzippp_uint32 level) const {
     if (!isOpen()) { return false; }
-    if (entry.zipFile!=this) { return false; }
+    if (!isEntryUsable(entry)) { return false; }
     if (mode==ReadOnly) { return false; }
     const libzippp_uint16 comp_libzip = convertCompressionToLibzip(comp);
 
@@ -573,7 +628,7 @@ ZipEntry ZipArchive::createEntry(struct zip_stat* stat) const {
     int crc = stat->crc;
     time_t time = stat->mtime;
 
-    return ZipEntry(this, name, index, time, compMethod, compressionLevel, encMethod, size, sizeComp, crc);
+    return ZipEntry(this, entrySession, name, index, time, compMethod, compressionLevel, encMethod, size, sizeComp, crc);
 }
 
 int ZipArchive::stateFlags(State state) {
@@ -584,8 +639,9 @@ ZipEntry ZipArchive::resolveEntry(const ZipEntry& zipEntry, State state, libzipp
     if (outSize!=nullptr) { *outSize = 0; }
 
     //a null-ZipEntry (e.g. obtained through getEntry in a state where the name does not
-    //exist) cannot be resolved in any state
-    if (zipEntry.isNull()) { return ZipEntry(); }
+    //exist) cannot be resolved in any state, nor can an entry coming from another archive
+    //or from an opening that has ended
+    if (!isEntryUsable(zipEntry)) { return ZipEntry(); }
 
     int flag = stateFlags(state);
     struct zip_stat stat;
@@ -672,7 +728,7 @@ ZipEntry ZipArchive::getEntry(libzippp_int64 index, State state) const {
 
 string ZipArchive::getEntryComment(const ZipEntry& entry, State state) const {
     if (!isOpen()) { return string(); }
-    if (entry.zipFile!=this) { return string(); }
+    if (!isEntryUsable(entry)) { return string(); }
 
     int flag = 0;
     if (state==Original) { flag = flag | LIBZIPPP_ORIGINAL_STATE_FLAGS; }
@@ -686,7 +742,7 @@ string ZipArchive::getEntryComment(const ZipEntry& entry, State state) const {
 
 bool ZipArchive::setEntryComment(const ZipEntry& entry, const string& comment) const {
     if (!isOpen()) { return false; }
-    if (entry.zipFile!=this) { return false; }
+    if (!isEntryUsable(entry)) { return false; }
 
     bool result = zip_file_set_comment(zipHandle, entry.getIndex(), comment.c_str(), (zip_uint16_t)comment.size(), ZIP_FL_ENC_GUESS) != 0;
     return result==0;
@@ -694,7 +750,7 @@ bool ZipArchive::setEntryComment(const ZipEntry& entry, const string& comment) c
 
 void* ZipArchive::readEntry(const ZipEntry& zipEntry, bool asText, State state, libzippp_uint64 size) const {
     if (!isOpen()) { return nullptr; }
-    if (zipEntry.zipFile!=this) { return nullptr; }
+    if (!isEntryUsable(zipEntry)) { return nullptr; }
 
     //resolve the entry in the requested state: the uncompressed size and the existence of
     //the entry depend on the state (a replacement may be longer, shorter or empty, a deleted
@@ -745,7 +801,7 @@ void* ZipArchive::readEntry(const string& zipEntry, bool asText, State state, li
 
 int ZipArchive::deleteEntry(const ZipEntry& entry) const {
     if (!isOpen()) { return LIBZIPPP_ERROR_NOT_OPEN; }
-    if (entry.zipFile!=this) { return LIBZIPPP_ERROR_INVALID_ENTRY; }
+    if (!isEntryUsable(entry)) { return LIBZIPPP_ERROR_INVALID_ENTRY; }
     if (mode==ReadOnly) { return LIBZIPPP_ERROR_NOT_ALLOWED; } //deletion not allowed
 
     if (entry.isFile()) {
@@ -777,7 +833,7 @@ int ZipArchive::deleteEntry(const string& e) const {
 
 int ZipArchive::renameEntry(const ZipEntry& entry, const string& newNameIn) const {
     if (!isOpen()) { return LIBZIPPP_ERROR_NOT_OPEN; }
-    if (entry.isNull() || entry.zipFile!=this) { return LIBZIPPP_ERROR_INVALID_ENTRY; }
+    if (!isEntryUsable(entry)) { return LIBZIPPP_ERROR_INVALID_ENTRY; }
     if (mode==ReadOnly) { return LIBZIPPP_ERROR_NOT_ALLOWED; } //renaming not allowed
     if (newNameIn.length()==0) { return LIBZIPPP_ERROR_INVALID_PARAMETER; }
 
@@ -1093,7 +1149,9 @@ int ZipArchive::readEntry(const ZipEntry& zipEntry, std::ostream& ofOutput, Stat
 
 int ZipArchive::readEntry(const ZipEntry& zipEntry, std::function<bool(const void*,libzippp_uint64)> writeFunc, State state, libzippp_uint64 chunksize) const {
     if (!isOpen()) { return LIBZIPPP_ERROR_NOT_OPEN; }
-    if (zipEntry.zipFile!=this) { return LIBZIPPP_ERROR_INVALID_ENTRY; }
+    //null entries, entries from other archives and entries from a previous opening are
+    //rejected before any data delivery (the output stream/callback is left untouched)
+    if (!isEntryUsable(zipEntry)) { return LIBZIPPP_ERROR_INVALID_ENTRY; }
 
     //resolve the entry in the requested state: its existence and uncompressed size depend
     //on the state. When it does not exist in the state, no data is delivered at all.

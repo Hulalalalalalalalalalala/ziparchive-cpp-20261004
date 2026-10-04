@@ -39,6 +39,7 @@
 #include <cstdint>
 #endif
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <vector>
 #include <functional>
@@ -119,6 +120,16 @@ typedef void ErrorHandlerCallback(const std::string& message,
 namespace libzippp {
     class ZipEntry;
     class ZipProgressListener;
+
+    /**
+     * Internal open-session marker. A new instance is created each time a ZipArchive is
+     * successfully opened (file, source or buffer based) and destroyed when that opening
+     * ends (close, discard or destruction of the ZipArchive). ZipEntry objects hold a
+     * weak reference to the session they were obtained from, which makes copies of an
+     * entry expire together when the archive is closed while never preventing the
+     * archive (nor its resources) from being released.
+     */
+    struct ZipEntrySession {};
 
     /**
      * Compression algorithm to use.
@@ -637,7 +648,24 @@ namespace libzippp {
 
         // User-defined error handler
         ErrorHandlerCallback* errorHandlingCallback;
-        
+
+        //open-session marker shared with every ZipEntry created by this opening
+        std::shared_ptr<ZipEntrySession> entrySession;
+
+        //creates/destroys the open-session marker shared with the entries
+        void beginEntrySession(void);
+        void endEntrySession(void);
+
+        /*
+         * Returns true if the specified entry may operate on this archive in its
+         * current opening: the entry must be non-null, must originate from this very
+         * ZipArchive and its open session must still be alive (i.e. this opening has
+         * not been closed, discarded nor destroyed). An entry obtained during a
+         * previous opening, even of the same path with an entry of the same name or
+         * index, is never usable.
+         */
+        bool isEntryUsable(const ZipEntry& entry) const;
+
         //open from in-memory data
         bool openBuffer(void** buffer, libzippp_uint32 sz, OpenMode mode=ReadOnly, bool checkConsistency=false);
         bool openSource(zip_source* source, OpenMode mode=ReadOnly, bool checkConsistency=false);
@@ -822,9 +850,13 @@ namespace libzippp {
          * The method doesn't close the ofstream after the extraction.
          */
         int readContent(std::ostream& ofOutput, ZipArchive::State state=ZipArchive::Current, libzippp_uint64 chunksize=LIBZIPPP_DEFAULT_CHUNK_SIZE) const;
-        
+
     private:
         const ZipArchive* zipFile;
+        //open session this entry was obtained from; it expires as soon as that
+        //opening ends (close, discard, archive destruction/free), independently of
+        //how many copies of this entry exist
+        std::weak_ptr<ZipEntrySession> session;
         std::string name;
         libzippp_uint64 index;
         time_t time;
@@ -834,9 +866,9 @@ namespace libzippp {
         libzippp_uint64 size;
         libzippp_uint64 sizeComp;
         int crc;
-        
-        ZipEntry(const ZipArchive* zipFile, const std::string& name, libzippp_uint64 index, time_t time, libzippp_uint16 compMethod, libzippp_uint32 compLevel, libzippp_uint16 encMethod, libzippp_uint64 size, libzippp_uint64 sizeComp, int crc) : 
-                zipFile(zipFile), name(name), index(index), time(time), compressionMethod(compMethod), compressionLevel(compLevel), encryptionMethod(encMethod), size(size), sizeComp(sizeComp), crc(crc) {}
+
+        ZipEntry(const ZipArchive* zipFile, const std::shared_ptr<ZipEntrySession>& session, const std::string& name, libzippp_uint64 index, time_t time, libzippp_uint16 compMethod, libzippp_uint32 compLevel, libzippp_uint16 encMethod, libzippp_uint64 size, libzippp_uint64 sizeComp, int crc) :
+                zipFile(zipFile), session(session), name(name), index(index), time(time), compressionMethod(compMethod), compressionLevel(compLevel), encryptionMethod(encMethod), size(size), sizeComp(sizeComp), crc(crc) {}
     };
 }
 
