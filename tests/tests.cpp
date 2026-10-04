@@ -43,9 +43,24 @@
 #include <string>
 
 #include "libzippp.h"
+#include <zip.h>
 
 using namespace std;
 using namespace libzippp;
+
+// Adds an entry directly through libzip. Unlike ZipArchive::addData, this helper does not
+// create the parent directories, so files can be inserted with only implicit parent
+// directories (no explicit "dir/" entry in the archive). A name ending with '/' creates a
+// directory entry.
+static void addRawEntry(zip* zh, const string& name, const char* content) {
+    if (!name.empty() && name[name.size()-1]=='/') {
+        assert(zip_dir_add(zh, name.c_str(), 0) >= 0);
+    } else {
+        zip_source_t* source = zip_source_buffer(zh, content, strlen(content), 0);
+        assert(source != nullptr);
+        assert(zip_file_add(zh, name.c_str(), source, 0) >= 0);
+    }
+}
 
 class SimpleProgressListener : public ZipProgressListener {
 public:
@@ -1066,13 +1081,256 @@ void test25() {
     cout << " done." << endl;
 }
 
+/*
+ * Atomic directory rename: a destination occupied by an entry that does not participate in
+ * the move must make renameEntry fail with LIBZIPPP_ERROR_UNKNOWN. The conflict check uses
+ * the current uncommitted state and must not be limited to the existence of the destination
+ * directory entry itself: here new/target/last.txt exists while there is no explicit new/ or
+ * new/target/ directory entry. On failure no entry is moved and no directory is created,
+ * even after closing and reopening the archive.
+ */
+void test26() {
+    cout << "Running test 26...";
+
+    {
+        //build the archive directly with libzip so that new/ and new/target/ stay implicit
+        int err = 0;
+        zip* zh = zip_open("test.zip", ZIP_CREATE|ZIP_TRUNCATE, &err);
+        assert(zh != nullptr);
+        addRawEntry(zh, "src/", "");
+        addRawEntry(zh, "src/first.txt", "FIRST");
+        addRawEntry(zh, "src/last.txt", "LAST");
+        addRawEntry(zh, "new/target/last.txt", "TARGET");
+        assert(zip_close(zh) == 0);
+    }
+
+    ZipArchive z("test.zip");
+    z.open(ZipArchive::Write);
+    assert(z.getNbEntries() == 4); //no explicit new/ nor new/target/
+    assert(!z.hasEntry("new/"));
+    assert(!z.hasEntry("new/target/"));
+
+    assert(z.renameEntry("src/", "new/target/") == LIBZIPPP_ERROR_UNKNOWN);
+
+    //the moved entries kept their original names and contents
+    assert(z.hasEntry("src/"));
+    assert(z.hasEntry("src/first.txt"));
+    assert(z.hasEntry("src/last.txt"));
+    assert(z.getEntry("src/first.txt").readAsText() == "FIRST");
+    assert(z.getEntry("src/last.txt").readAsText() == "LAST");
+    //the conflicting entry is untouched
+    assert(z.hasEntry("new/target/last.txt"));
+    assert(z.getEntry("new/target/last.txt").readAsText() == "TARGET");
+    //no parent directory was created by the failed call
+    assert(!z.hasEntry("new/"));
+    assert(!z.hasEntry("new/target/"));
+    assert(z.close() == LIBZIPPP_OK);
+
+    //the failure left no trace on disk either
+    ZipArchive r("test.zip");
+    r.open(ZipArchive::ReadOnly);
+    assert(r.getNbEntries() == 4);
+    assert(r.hasEntry("src/") && r.hasEntry("src/first.txt") && r.hasEntry("src/last.txt"));
+    assert(r.hasEntry("new/target/last.txt"));
+    assert(!r.hasEntry("new/") && !r.hasEntry("new/target/"));
+    r.close();
+    r.unlink();
+
+    cout << " done." << endl;
+}
+
+/*
+ * A failed directory rename must roll back to the archive state just before the call (not
+ * the state at opening time): previously added entries, replaced contents, modified
+ * comments and deletions all survive. The archive stays open and usable, so the rename can
+ * be retried with a conflict-free name; everything is then visible after a close/reopen.
+ */
+void test27() {
+    cout << "Running test 27...";
+
+    {
+        int err = 0;
+        zip* zh = zip_open("test.zip", ZIP_CREATE|ZIP_TRUNCATE, &err);
+        assert(zh != nullptr);
+        addRawEntry(zh, "src/", "");
+        addRawEntry(zh, "src/first.txt", "FIRST");
+        addRawEntry(zh, "src/last.txt", "LAST");
+        addRawEntry(zh, "new/target/last.txt", "TARGET");
+        addRawEntry(zh, "victim.txt", "V");
+        assert(zip_close(zh) == 0);
+    }
+
+    ZipArchive z("test.zip");
+    z.open(ZipArchive::Write);
+
+    //pending modifications performed before the failing rename
+    assert(z.addData("added.txt", "A", 1));
+    assert(z.addData("src/first.txt", "REPLACED", 8));
+    assert(z.getEntry("src/last.txt").setComment("last-comment"));
+    assert(z.deleteEntry("victim.txt") == 1);
+
+    assert(z.renameEntry("src/", "new/target/") == LIBZIPPP_ERROR_UNKNOWN);
+
+    //the prior uncommitted modifications are all still there
+    assert(z.hasEntry("added.txt"));
+    assert(z.getEntry("src/first.txt").readAsText() == "REPLACED");
+    assert(z.getEntry("src/last.txt").getComment() == "last-comment");
+    assert(!z.hasEntry("victim.txt"));
+    //and the failed move left no trace
+    assert(z.hasEntry("src/") && z.hasEntry("src/first.txt") && z.hasEntry("src/last.txt"));
+    assert(!z.hasEntry("new/") && !z.hasEntry("new/target/"));
+
+    //retry with a free name while the archive is still open
+    assert(z.renameEntry("src/", "moved/") == 3);
+    assert(z.hasEntry("moved/") && z.hasEntry("moved/first.txt") && z.hasEntry("moved/last.txt"));
+    assert(!z.hasEntry("src/"));
+    assert(z.getEntry("moved/first.txt").readAsText() == "REPLACED");
+    assert(z.getEntry("moved/last.txt").getComment() == "last-comment");
+    assert(z.close() == LIBZIPPP_OK);
+
+    ZipArchive r("test.zip");
+    r.open(ZipArchive::ReadOnly);
+    assert(r.hasEntry("added.txt"));
+    assert(r.hasEntry("moved/") && r.hasEntry("moved/first.txt") && r.hasEntry("moved/last.txt"));
+    assert(!r.hasEntry("src/") && !r.hasEntry("new/"));
+    assert(r.getEntry("moved/first.txt").readAsText() == "REPLACED");
+    assert(r.getEntry("moved/last.txt").getComment() == "last-comment");
+    assert(r.getEntry("new/target/last.txt").readAsText() == "TARGET");
+    assert(!r.hasEntry("victim.txt"));
+    r.close();
+    r.unlink();
+
+    cout << " done." << endl;
+}
+
+/*
+ * Moving a directory below its own path is supported. Entries that participate in the move
+ * and free their original name must not be considered destination conflicts. Moving a/, a/b/
+ * and a/b/file.bin to a/b/ yields a/, a/b/, a/b/b/ and a/b/b/file.bin (the re-created a/
+ * parent is not counted), and the returned value is the number of renamed pre-existing
+ * entries (3).
+ */
+void test28() {
+    cout << "Running test 28...";
+
+    {
+        int err = 0;
+        zip* zh = zip_open("test.zip", ZIP_CREATE|ZIP_TRUNCATE, &err);
+        assert(zh != nullptr);
+        addRawEntry(zh, "a/", "");
+        addRawEntry(zh, "a/b/", "");
+        addRawEntry(zh, "a/b/file.bin", "BIN");
+        assert(zip_close(zh) == 0);
+    }
+
+    ZipArchive z("test.zip");
+    z.open(ZipArchive::Write);
+    ZipEntry dir = z.getEntry("a/");
+    assert(!dir.isNull() && dir.isDirectory());
+    assert(z.renameEntry(dir, "a/b/") == 3);
+
+    assert(z.hasEntry("a/"));
+    assert(z.hasEntry("a/b/"));
+    assert(z.hasEntry("a/b/b/"));
+    assert(z.hasEntry("a/b/b/file.bin"));
+    assert(!z.hasEntry("a/b/file.bin"));
+    assert(z.getEntry("a/b/b/file.bin").readAsText() == "BIN");
+    assert(z.close() == LIBZIPPP_OK);
+
+    ZipArchive r("test.zip");
+    r.open(ZipArchive::ReadOnly);
+    assert(r.getNbEntries() == 4);
+    assert(r.hasEntry("a/") && r.hasEntry("a/b/") && r.hasEntry("a/b/b/") && r.hasEntry("a/b/b/file.bin"));
+    r.close();
+    r.unlink();
+
+    cout << " done." << endl;
+}
+
+/*
+ * Miscellaneous directory rename rules:
+ * - an empty directory obeys the same success/failure rules,
+ * - the trailing '/' is appended to the destination when missing,
+ * - entries with a similar but non-descendant name are not moved,
+ * - missing parent directories are created (but not counted),
+ * - file content, relative paths and entry comments follow the entries.
+ */
+void test29() {
+    cout << "Running test 29...";
+
+    {
+        int err = 0;
+        zip* zh = zip_open("test.zip", ZIP_CREATE|ZIP_TRUNCATE, &err);
+        assert(zh != nullptr);
+        addRawEntry(zh, "empty/", "");
+        addRawEntry(zh, "new/target/last.txt", "T");
+        assert(zip_close(zh) == 0);
+    }
+
+    //empty directory conflicts like any other directory
+    ZipArchive ze("test.zip");
+    ze.open(ZipArchive::Write);
+    assert(ze.renameEntry("empty/", "new/target/") == LIBZIPPP_ERROR_UNKNOWN);
+    assert(ze.hasEntry("empty/"));
+    assert(!ze.hasEntry("new/") && !ze.hasEntry("new/target/"));
+    //no trailing slash on the destination: it is appended
+    assert(ze.renameEntry("empty/", "renamed-empty") == 1);
+    assert(ze.hasEntry("renamed-empty/"));
+    assert(!ze.hasEntry("empty/"));
+    ze.close();
+    ze.unlink();
+
+    //similar names, parent creation, content and comment preservation
+    {
+        int err = 0;
+        zip* zh = zip_open("test.zip", ZIP_CREATE|ZIP_TRUNCATE, &err);
+        assert(zh != nullptr);
+        addRawEntry(zh, "d/", "");
+        addRawEntry(zh, "d/sub/", "");
+        addRawEntry(zh, "d/sub/a.txt", "AAA");
+        addRawEntry(zh, "d/b.txt", "BBB");
+        addRawEntry(zh, "d-sibling/", "");
+        addRawEntry(zh, "d-sibling/f.txt", "SIBLING");
+        addRawEntry(zh, "d2.txt", "OTHER");
+        assert(zip_close(zh) == 0);
+    }
+
+    ZipArchive z("test.zip");
+    z.open(ZipArchive::Write);
+    assert(z.getEntry("d/sub/a.txt").setComment("comment-a"));
+    int renamed = z.renameEntry("d/", "x/y/z/");
+    assert(renamed == 4); //d/, d/sub/, d/sub/a.txt, d/b.txt - the created x/, x/y/ do not count
+
+    assert(z.hasEntry("x/") && z.hasEntry("x/y/") && z.hasEntry("x/y/z/"));
+    assert(z.hasEntry("x/y/z/sub/a.txt") && z.hasEntry("x/y/z/b.txt"));
+    assert(!z.hasEntry("d/") && !z.hasEntry("d/sub/a.txt"));
+    assert(z.getEntry("x/y/z/sub/a.txt").readAsText() == "AAA");
+    assert(z.getEntry("x/y/z/b.txt").readAsText() == "BBB");
+    assert(z.getEntry("x/y/z/sub/a.txt").getComment() == "comment-a");
+
+    //similar names are untouched
+    assert(z.hasEntry("d-sibling/") && z.hasEntry("d-sibling/f.txt"));
+    assert(z.getEntry("d-sibling/f.txt").readAsText() == "SIBLING");
+    assert(z.hasEntry("d2.txt"));
+    assert(z.getEntry("d2.txt").readAsText() == "OTHER");
+    z.close();
+
+    ZipArchive r("test.zip");
+    r.open(ZipArchive::ReadOnly);
+    assert(r.getNbEntries() == 9); //4 moved + 2 created parents + d-sibling/ + its file + d2.txt
+    r.close();
+    r.unlink();
+
+    cout << " done." << endl;
+}
+
 int main() {
     test1();  test2();  test3();  test4();  test5();
     test6();  test7();  test8();  test9();  test10();
     test11(); test12(); test13(); test14(); test15();
     test16(); test17(); test18(); test19(); test20();
     test21(); test22(); test23(); test23_2(); test24();
-    test25();
+    test25(); test26(); test27(); test28(); test29();
     return 0;
 }
 

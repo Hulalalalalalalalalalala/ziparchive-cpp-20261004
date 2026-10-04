@@ -488,23 +488,29 @@ namespace libzippp {
         
         /**
          * Renames the entry with the specified newName. The method returns the number of entries
-         * that have been renamed, LIBZIPPP_ERROR_INVALID_PARAMETER if the new name is invalid, 
-         * LIBZIPPP_ERROR_NOT_ALLOWED if the mode doesn't allow modification or LIBZIPPP_ERROR_UNKNOWN if an error 
-         * occurred. If the entry is a directory, a '/' will automatically be appended at the end of newName if the 
-         * latter hasn't it already. All the files in the folder will be moved.
+         * that have been renamed, LIBZIPPP_ERROR_INVALID_PARAMETER if the new name is invalid,
+         * LIBZIPPP_ERROR_NOT_ALLOWED if the mode doesn't allow modification or LIBZIPPP_ERROR_UNKNOWN if an error
+         * occurred. If the entry is a directory, a '/' will automatically be appended at the end of newName if the
+         * latter hasn't it already. All the files in the folder will be moved (the folder itself included),
+         * preserving their content, comments and relative paths.
+         * Any missing parent directory of the destination is created automatically; these extra directories
+         * are not counted in the returned value.
+         * The rename is atomic: if any entry that does not participate in the move already occupies the
+         * destination (the destination itself or one of its descendants, including entries whose parent
+         * directories are only implicit in the archive), LIBZIPPP_ERROR_UNKNOWN is returned and the archive
+         * is left exactly as it was before the call (no entry is moved and no directory is created). The
+         * check is performed against the current, possibly uncommitted, state of the archive. Moving a
+         * directory below its own path is supported (e.g. a/ to a/b/).
          * If the ZipArchive is not open or the entry was not edited by this ZipArchive or is a null-ZipEntry,
          * then LIBZIPPP_ERROR_INVALID_ENTRY will be returned.
          */
         int renameEntry(const ZipEntry& entry, const std::string& newName) const;
-        
+
         /**
-         * Renames the entry with the specified newName. The method returns the number of entries
-         * that have been renamed, LIBZIPPP_ERROR_INVALID_PARAMETER if the new name is invalid, 
-         * LIBZIPPP_ERROR_NOT_ALLOWED if the mode doesn't allow modification or LIBZIPPP_ERROR_UNKNOWN if an error 
-         * occurred. If the entry is a directory, a '/' will automatically be appended at the end of newName if the 
-         * latter hasn't it already. All the files in the folder will be moved.
-         * If the ZipArchive is not open or the entry was not edited by this ZipArchive or is a null-ZipEntry,
-         * then LIBZIPPP_ERROR_INVALID_ENTRY will be returned. If the entry does not exist, this method returns LIBZIPPP_ERROR_INVALID_PARAMETER.
+         * Renames the entry with the specified newName. This behaves exactly as the ZipEntry overload
+         * (atomic directory move, automatic parent directory creation and LIBZIPPP_ERROR_UNKNOWN on
+         * destination conflict). If the entry does not exist, this method returns
+         * LIBZIPPP_ERROR_INVALID_PARAMETER.
          */
         int renameEntry(const std::string& entry, const std::string& newName) const;
         
