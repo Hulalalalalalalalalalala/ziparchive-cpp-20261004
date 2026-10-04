@@ -41,6 +41,9 @@
 #include <errno.h>
 #include <fstream>
 #include <memory>
+#include <set>
+#include <algorithm>
+#include <utility>
 
 #include "libzippp.h"
 
@@ -730,6 +733,40 @@ int ZipArchive::deleteEntry(const string& e) const {
     return deleteEntry(entry);
 }
 
+// Orders entries from the deepest path to the shallowest one, so that children
+// are renamed before the directories that contain them.
+static bool deepestEntryFirst(const pair<ZipEntry,string>& left, const pair<ZipEntry,string>& right) {
+    return left.first.getName().length() > right.first.getName().length();
+}
+
+// Creates the given directory entry and all its missing parent directories.
+// The names of the directories that have actually been created are appended to
+// createdDirs (in creation order) so the operation can be rolled back later.
+static bool createDirectoryHierarchy(zip* zipHandle, const string& entryName, vector<string>& createdDirs) {
+    string::size_type nextSlash = entryName.find(LIBZIPPP_ENTRY_PATH_SEPARATOR);
+    while (nextSlash!=string::npos) {
+        string pathToCreate = entryName.substr(0, nextSlash+1);
+        libzippp_int64 existing = zip_name_locate(zipHandle, pathToCreate.c_str(), ZIP_FL_ENC_GUESS);
+        if (existing<0) {
+            libzippp_int64 result = zip_dir_add(zipHandle, pathToCreate.c_str(), ZIP_FL_ENC_GUESS);
+            if (result==-1) { return false; }
+            createdDirs.push_back(pathToCreate);
+        }
+        nextSlash = entryName.find(LIBZIPPP_ENTRY_PATH_SEPARATOR, nextSlash+1);
+    }
+    return true;
+}
+
+// Removes the given directory entries (deepest first). Used to restore the
+// state of the archive when a rename cannot be completed entirely.
+static void removeCreatedDirectories(zip* zipHandle, const vector<string>& createdDirs) {
+    vector<string>::const_reverse_iterator dit;
+    for(dit=createdDirs.rbegin() ; dit!=createdDirs.rend() ; ++dit) {
+        libzippp_int64 index = zip_name_locate(zipHandle, dit->c_str(), ZIP_FL_ENC_GUESS);
+        if (index>=0) { zip_delete(zipHandle, index); }
+    }
+}
+
 int ZipArchive::renameEntry(const ZipEntry& entry, const string& newName) const {
     if (!isOpen()) { return LIBZIPPP_ERROR_NOT_OPEN; }
     if (entry.zipFile!=this) { return LIBZIPPP_ERROR_INVALID_ENTRY; }
@@ -740,61 +777,101 @@ int ZipArchive::renameEntry(const ZipEntry& entry, const string& newName) const 
     if (entry.isFile()) {
         if (LIBZIPPP_ENTRY_IS_DIRECTORY(newName)) { return LIBZIPPP_ERROR_INVALID_PARAMETER; } //invalid new name
 
+        vector<string> createdDirs;
         string::size_type lastSlash = newName.rfind(LIBZIPPP_ENTRY_PATH_SEPARATOR);
-        if (lastSlash!=1) {
-            bool dadded = addEntry(newName.substr(0, lastSlash+1));
-            if (!dadded) { return LIBZIPPP_ERROR_UNKNOWN; } //the hierarchy hasn't been created
+        if (lastSlash!=string::npos) {
+            bool dadded = createDirectoryHierarchy(zipHandle, newName.substr(0, lastSlash+1), createdDirs);
+            if (!dadded) {
+                removeCreatedDirectories(zipHandle, createdDirs); //the hierarchy hasn't been created
+                return LIBZIPPP_ERROR_UNKNOWN;
+            }
         }
 
         int result = zip_file_rename(zipHandle, entry.getIndex(), newName.c_str(), ZIP_FL_ENC_GUESS);
         if (result==0) { return 1; }
+        removeCreatedDirectories(zipHandle, createdDirs); //restores the state as it was before the call
         return LIBZIPPP_ERROR_UNKNOWN; //renaming was not possible (entry already exists ?)
     } else {
-        if (!LIBZIPPP_ENTRY_IS_DIRECTORY(newName)) { return LIBZIPPP_ERROR_INVALID_PARAMETER; } //invalid new name
+        //as documented, a trailing '/' is appended to the new name of a directory if missing
+        string targetName = newName;
+        if (!LIBZIPPP_ENTRY_IS_DIRECTORY(targetName)) { targetName += LIBZIPPP_ENTRY_PATH_SEPARATOR; }
+        if (targetName==entry.getName()) { return LIBZIPPP_ERROR_INVALID_PARAMETER; }
 
-      string::size_type parentSlash = newName.rfind(LIBZIPPP_ENTRY_PATH_SEPARATOR, newName.length()-2);
-        if (parentSlash!=string::npos) { //updates the dir hierarchy
-            string parent = newName.substr(0, parentSlash+1);
-            bool dadded = addEntry(parent);
-            if (!dadded) { return LIBZIPPP_ERROR_UNKNOWN; }
-        }
-
-        int counter = 0;
         string originalName = entry.getName();
         vector<ZipEntry> allEntries = getEntries();
+
+        //collects the entries involved in the move (the directory itself and all its
+        //descendants) along with their target names, and remembers the names of the
+        //other entries for the conflict detection
+        vector<pair<ZipEntry,string> > moves;
+        set<string> externalNames;
         vector<ZipEntry>::const_iterator eit;
         for(eit=allEntries.begin() ; eit!=allEntries.end() ; ++eit) {
-            ZipEntry ze = *eit;
-            string currentName = ze.getName();
-
-            string::size_type startPosition = currentName.find(originalName);
-            if (startPosition==0) {
-                if (currentName == originalName) {
-                    int result = zip_file_rename(zipHandle, entry.getIndex(), newName.c_str(), ZIP_FL_ENC_GUESS);
-                    if (result==0) { ++counter; }
-                    else { return LIBZIPPP_ERROR_UNKNOWN;  } //unable to rename the folder
-                } else  {
-                    string targetName = currentName.replace(0, originalName.length(), newName);
-                    int result = zip_file_rename(zipHandle, ze.getIndex(), targetName.c_str(), ZIP_FL_ENC_GUESS);
-                    if (result==0) { ++counter; }
-                    else { return LIBZIPPP_ERROR_UNKNOWN; } //unable to rename a sub-entry
-                }
+            string currentName = eit->getName();
+            if (currentName.compare(0, originalName.length(), originalName)==0) {
+                string target = targetName + currentName.substr(originalName.length());
+                moves.push_back(make_pair(*eit, target));
             } else {
-                //file not affected by the renaming
+                externalNames.insert(currentName);
             }
+        }
+
+        //an entry that doesn't take part in the move already uses one of the target
+        //names: renaming would overwrite a file or merge directories, so the whole
+        //operation is rejected before anything is modified
+        vector<pair<ZipEntry,string> >::const_iterator mit;
+        for(mit=moves.begin() ; mit!=moves.end() ; ++mit) {
+            if (externalNames.find(mit->second)!=externalNames.end()) { return LIBZIPPP_ERROR_UNKNOWN; }
+        }
+
+        //creates the missing parent directories of the target, keeping track of the
+        //ones actually added so they can be removed if the rename can't be completed
+        vector<string> createdDirs;
+        string::size_type parentSlash = targetName.rfind(LIBZIPPP_ENTRY_PATH_SEPARATOR, targetName.length()-2);
+        if (parentSlash!=string::npos) { //updates the dir hierarchy
+            string parent = targetName.substr(0, parentSlash+1);
+            bool dadded = createDirectoryHierarchy(zipHandle, parent, createdDirs);
+            if (!dadded) {
+                removeCreatedDirectories(zipHandle, createdDirs);
+                return LIBZIPPP_ERROR_UNKNOWN;
+            }
+        }
+
+        //renames the deepest entries first so that a directory moved into its own
+        //path doesn't collide with the entries that are about to vacate their name
+        sort(moves.begin(), moves.end(), deepestEntryFirst);
+
+        vector<pair<ZipEntry,string> > doneMoves;
+        bool failed = false;
+        vector<pair<ZipEntry,string> >::const_iterator mvit;
+        for(mvit=moves.begin() ; mvit!=moves.end() ; ++mvit) {
+            int result = zip_file_rename(zipHandle, mvit->first.getIndex(), mvit->second.c_str(), ZIP_FL_ENC_GUESS);
+            if (result==0) { doneMoves.push_back(*mvit); }
+            else { failed = true; break; } //unable to rename an entry
         }
 
         /*
          * Special case for moving a directory a/x to a/x/y to avoid to lose
          * the a/x path in the archive.
          */
-        bool newNameIsInsideCurrent = (newName.find(entry.getName())==0);
-        if (newNameIsInsideCurrent) {
-            bool dadded = addEntry(newName);
-            if (!dadded) { return LIBZIPPP_ERROR_UNKNOWN; }
+        if (!failed && targetName.find(originalName)==0) {
+            bool dadded = createDirectoryHierarchy(zipHandle, targetName, createdDirs);
+            if (!dadded) { failed = true; }
         }
 
-        return counter;
+        if (failed) {
+            //restores the archive to the state it had before the call: the directories
+            //added by this operation are removed first so the moved entries can take
+            //their original names back, then the renames are reverted in reverse order
+            removeCreatedDirectories(zipHandle, createdDirs);
+            vector<pair<ZipEntry,string> >::const_reverse_iterator rit;
+            for(rit=doneMoves.rbegin() ; rit!=doneMoves.rend() ; ++rit) {
+                zip_file_rename(zipHandle, rit->first.getIndex(), rit->first.getName().c_str(), ZIP_FL_ENC_GUESS);
+            }
+            return LIBZIPPP_ERROR_UNKNOWN;
+        }
+
+        return (int)moves.size(); //the directories created for the hierarchy are not counted
     }
 }
 
