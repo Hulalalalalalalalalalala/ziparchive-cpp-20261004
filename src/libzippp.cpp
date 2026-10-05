@@ -176,6 +176,113 @@ static void defaultErrorHandler(const std::string& message,
     fprintf(stderr, message.c_str(), strerror.c_str());
 }
 
+/*
+ * State of the custom zip_source backing an entry staged from an std::istream
+ * (see ZipArchive::addData(const std::string&, std::istream&, ...)). The content
+ * lives in a temporary file created with tmpfile(): it is removed by the operating
+ * system as soon as the file is closed, and the FILE* is owned and closed by the
+ * ZipArchive (see stagedStreamFiles), never by this source. The source itself only
+ * owns this small state, which is released when libzip frees the source.
+ */
+struct IstreamSourceState {
+    FILE* file;
+    libzippp_uint64 size;
+    libzippp_uint64 offset;
+    zip_error_t error;
+};
+
+static int seekIstreamSourceFile(FILE* file, libzippp_uint64 offset) {
+#ifdef _WIN32
+    return _fseeki64(file, (__int64)offset, SEEK_SET);
+#else
+    return fseek(file, (long)offset, SEEK_SET);
+#endif
+}
+
+static zip_int64_t istreamSourceCallback(void* userdata, void* data, zip_uint64_t len, zip_source_cmd_t cmd) {
+    IstreamSourceState* state = static_cast<IstreamSourceState*>(userdata);
+    switch (cmd) {
+        case ZIP_SOURCE_OPEN:
+            //a staged source is (re)opened for every read of the entry and for every
+            //commit attempt (a cancelled commit may be retried): always restart from
+            //the beginning of the staged content
+            if (seekIstreamSourceFile(state->file, 0)!=0) {
+                zip_error_set(&state->error, ZIP_ER_SEEK, errno);
+                return -1;
+            }
+            state->offset = 0;
+            return 0;
+
+        case ZIP_SOURCE_READ: {
+            zip_uint64_t remaining = state->size - state->offset;
+            zip_uint64_t toRead = len<remaining ? len : remaining;
+            if (toRead==0) { return 0; }
+            size_t got = fread(data, 1, (size_t)toRead, state->file);
+            state->offset += got;
+            if (got<(size_t)toRead && ferror(state->file)) {
+                zip_error_set(&state->error, ZIP_ER_READ, errno);
+                return -1;
+            }
+            return (zip_int64_t)got;
+        }
+
+        case ZIP_SOURCE_CLOSE:
+            //the staging file stays open: it belongs to the archive, which closes it
+            //when the pending changes are committed, abandoned or destroyed
+            return 0;
+
+        case ZIP_SOURCE_STAT: {
+            if (len<sizeof(zip_stat_t)) {
+                zip_error_set(&state->error, ZIP_ER_INVAL, 0);
+                return -1;
+            }
+            //mirrors the stat of a buffer source: the staged content is the raw,
+            //uncompressed and unencrypted data of the entry
+            zip_stat_t* st = (zip_stat_t*)data;
+            zip_stat_init(st);
+            st->size = state->size;
+            st->comp_size = state->size;
+            st->comp_method = ZIP_CM_STORE;
+            st->encryption_method = ZIP_EM_NONE;
+            st->valid = ZIP_STAT_SIZE | ZIP_STAT_COMP_SIZE | ZIP_STAT_COMP_METHOD | ZIP_STAT_ENCRYPTION_METHOD;
+            return sizeof(zip_stat_t);
+        }
+
+        case ZIP_SOURCE_ERROR:
+            return zip_error_to_data(&state->error, data, len);
+
+        case ZIP_SOURCE_FREE:
+            //only the state belongs to the source; the staging file is closed by the
+            //archive (see stagedStreamFiles), never here
+            delete state;
+            return 0;
+
+        case ZIP_SOURCE_SEEK: {
+            zip_int64_t newOffset = zip_source_seek_compute_offset(state->offset, state->size, data, len, &state->error);
+            if (newOffset<0) { return -1; }
+            if (seekIstreamSourceFile(state->file, (libzippp_uint64)newOffset)!=0) {
+                zip_error_set(&state->error, ZIP_ER_SEEK, errno);
+                return -1;
+            }
+            state->offset = (libzippp_uint64)newOffset;
+            return 0;
+        }
+
+        case ZIP_SOURCE_TELL:
+            return (zip_int64_t)state->offset;
+
+        case ZIP_SOURCE_SUPPORTS:
+            //seekable, and re-openable so that the staged entry can be read back
+            //(Current state) and committed as many times as needed
+            return ZIP_SOURCE_SUPPORTS_SEEKABLE | ZIP_SOURCE_MAKE_COMMAND_BITMASK(ZIP_SOURCE_SUPPORTS_REOPEN);
+
+        default:
+            zip_error_set(&state->error, ZIP_ER_OPNOTSUPP, 0);
+            return -1;
+    }
+}
+
+
 ZipEntry::ZipEntry(void) : zipFile(nullptr), index(0), time(0), compressionMethod(ZIP_CM_DEFAULT), compressionLevel(0), encryptionMethod(ZIP_EM_NONE), size(0), sizeComp(0), crc(0) {
 }
 
@@ -310,6 +417,9 @@ ZipArchive::~ZipArchive(void) {
     //if the commit failed in close(), the archive is gone anyway: the adopted buffers
     //must not outlive it (on a successful close/discard this is a no-op)
     releaseAdoptedBuffers();
+
+    //same for the files staging stream-written entries (see stagedStreamFiles)
+    releaseStagedStreamFiles();
 
     //whatever close() did (including a failed commit), the archive object itself is
     //gone: every entry obtained from any opening must be expired now
@@ -525,6 +635,10 @@ int ZipArchive::close(void) {
         //the commit consumed the sources: the buffers adopted with freeData=true are
         //no longer referenced by libzip and are released exactly once, here
         releaseAdoptedBuffers();
+        //the staging files of stream-written entries are not needed anymore either
+        //(on a failed commit, e.g. a cancellation, they are kept so that a later
+        //close can still commit the staged content)
+        releaseStagedStreamFiles();
         progress_callback(zipHandle, 1, this); //enforce the last progression call to be one
 
         //push back the changes in the buffer
@@ -608,6 +722,9 @@ void ZipArchive::discard(void) {
 
         //the pending sources are gone: release the buffers adopted with freeData=true
         releaseAdoptedBuffers();
+
+        //and the files staging stream-written entries
+        releaseStagedStreamFiles();
 
         if (bufferData!=nullptr && (mode==New || mode==Write)) {
             zip_source_free(zipSource);
@@ -940,6 +1057,7 @@ int ZipArchive::deleteEntry(const ZipEntry& entry) const {
         int result = zip_delete(zipHandle, entry.getIndex());
         if (result==0) {
             forgetEntryCompressionConfig(entry.getIndex());
+            forgetStagedStreamFile(entry.getIndex());
             return 1;
         }
         return LIBZIPPP_ERROR_UNKNOWN; //unable to delete the entry
@@ -954,6 +1072,7 @@ int ZipArchive::deleteEntry(const ZipEntry& entry) const {
                 int result = zip_delete(zipHandle, ze.getIndex());
                 if (result==0) {
                     forgetEntryCompressionConfig(ze.getIndex());
+                    forgetStagedStreamFile(ze.getIndex());
                     ++counter;
                 }
                 else { return LIBZIPPP_ERROR_UNKNOWN; } //unable to remove the current entry
@@ -1157,6 +1276,23 @@ void ZipArchive::releaseAdoptedBuffers(void) {
     adoptedBuffers.clear();
 }
 
+void ZipArchive::releaseStagedStreamFiles(void) {
+    for(map<libzippp_uint64, FILE*>::iterator it=stagedStreamFiles.begin() ; it!=stagedStreamFiles.end() ; ++it) {
+        fclose(it->second);
+    }
+    stagedStreamFiles.clear();
+}
+
+void ZipArchive::forgetStagedStreamFile(libzippp_uint64 index) const {
+    map<libzippp_uint64, FILE*>::iterator it = stagedStreamFiles.find(index);
+    if (it!=stagedStreamFiles.end()) {
+        //the source of the entry is gone (deleted or replaced): libzip never closes
+        //the staging file itself, so it is closed exactly once, here
+        fclose(it->second);
+        stagedStreamFiles.erase(it);
+    }
+}
+
 bool ZipArchive::isArchiveCompressionApplicable(void) const {
     if (!useArchiveCompressionMethod && compressionLevel==0) { return true; }
 
@@ -1217,7 +1353,7 @@ void ZipArchive::rollbackCreatedDirectories(const vector<libzippp_uint64>& creat
     }
 }
 
-bool ZipArchive::installPreparedSource(const string& entryName, zip_source* source, const vector<libzippp_uint64>& createdDirIndices) const {
+bool ZipArchive::installPreparedSource(const string& entryName, zip_source* source, const vector<libzippp_uint64>& createdDirIndices, libzippp_uint64* addedIndex) const {
     libzippp_int64 result = zip_file_add(zipHandle, entryName.c_str(), source, ZIP_FL_OVERWRITE);
     if (result<0) {
         //the source was not adopted by libzip: release it without touching its data
@@ -1262,6 +1398,7 @@ bool ZipArchive::installPreparedSource(const string& entryName, zip_source* sour
         entryCompressionMethods[(libzippp_uint64)result] = compressionMethod;
         entryCompressionLevels[(libzippp_uint64)result] = compressionLevel;
     }
+    if (addedIndex!=nullptr) { *addedIndex = (libzippp_uint64)result; }
     return true;
 }
 
@@ -1291,7 +1428,12 @@ bool ZipArchive::addFile(const string& entryName, const string& file) const {
         rollbackCreatedDirectories(createdDirIndices);
         return false;
     }
-    return installPreparedSource(entryName, source, createdDirIndices);
+    libzippp_uint64 index = 0;
+    if (!installPreparedSource(entryName, source, createdDirIndices, &index)) { return false; }
+    //a stream-staged content previously staged for this entry is not referenced
+    //anymore: its staging file is released (see stagedStreamFiles)
+    forgetStagedStreamFile(index);
+    return true;
 }
 
 bool ZipArchive::addData(const string& entryName, const void* data, libzippp_uint64 length, bool freeData) const {
@@ -1323,7 +1465,11 @@ bool ZipArchive::addData(const string& entryName, const void* data, libzippp_uin
         rollbackCreatedDirectories(createdDirIndices);
         return false;
     }
-    if (!installPreparedSource(entryName, source, createdDirIndices)) { return false; }
+    libzippp_uint64 index = 0;
+    if (!installPreparedSource(entryName, source, createdDirIndices, &index)) { return false; }
+    //a stream-staged content previously staged for this entry is not referenced
+    //anymore: its staging file is released (see stagedStreamFiles)
+    forgetStagedStreamFile(index);
 
     if (freeData && data!=nullptr) {
         adoptedBuffers.push_back(const_cast<void*>(data));
@@ -1347,6 +1493,120 @@ bool ZipArchive::addData(const std::string& entryName, const std::basic_string<l
         ::free(copy);
         return false;
     }
+    return true;
+}
+
+bool ZipArchive::addData(const string& entryName, std::istream& input, libzippp_uint64 chunksize) const {
+    if (!isOpen()) { return false; }
+    if (mode==ReadOnly) { return false; } //adding not allowed
+    if (entryName.empty()) { return false; }
+    if (LIBZIPPP_ENTRY_IS_DIRECTORY(entryName)) { return false; }
+
+    //see addFile: the selected compression/encryption must be applicable beforehand;
+    //all the checks above happen before a single byte is consumed from the stream
+    if (!isArchiveCompressionApplicable()) { return false; }
+    if (!isArchiveEncryptionApplicable()) { return false; }
+
+    if (chunksize==0) { chunksize = LIBZIPPP_DEFAULT_CHUNK_SIZE; }
+
+    /*
+     * The content is staged in a temporary file (removed by the operating system as
+     * soon as the file is closed) and handed to libzip through a custom source: the
+     * memory footprint stays bounded whatever the stream length and, once this method
+     * has returned, neither reading the entry nor committing depends on the stream.
+     */
+    FILE* staging = tmpfile();
+    if (staging==nullptr) { return false; }
+
+    char* chunk = NEW_CHAR_ARRAY(chunksize)
+    if (chunk==nullptr) {
+        fclose(staging);
+        return false;
+    }
+
+    libzippp_uint64 total = 0;
+    std::streamsize pending = 0; //bytes extracted by the last read, not staged yet
+    bool failed = false;
+    bool ended = false;
+    try {
+        for (;;) {
+            input.read(chunk, (std::streamsize)chunksize);
+            pending = input.gcount();
+            if (pending>0) {
+                if (fwrite(chunk, 1, (size_t)pending, staging)!=(size_t)pending) { failed = true; break; } //unable to save the read data
+                total += (libzippp_uint64)pending;
+                pending = 0;
+            }
+            if (input.eof()) { ended = true; break; } //normal end, possibly after a final partial chunk
+            if (input.fail() || input.bad()) { failed = true; break; } //read error (or an already unusable stream)
+        }
+    } catch (...) {
+        //a stream whose exceptions are enabled throws on its normal end (eofbit/failbit)
+        //exactly like on a read error: the stream state tells both cases apart. The
+        //bytes extracted before the throw are still reported by gcount() (the pending
+        //assignment above did not run), so they are staged too.
+        pending = input.gcount();
+        if (pending>0) {
+            if (fwrite(chunk, 1, (size_t)pending, staging)==(size_t)pending) { total += (libzippp_uint64)pending; }
+            else { failed = true; }
+        }
+        if (!failed) {
+            ended = input.eof() && !input.bad();
+            failed = !ended;
+        }
+    }
+    delete[] chunk;
+
+    if (failed || !ended) {
+        //the archive has not been touched yet: no entry, no parent directory, and the
+        //bytes already consumed from the stream are simply dropped
+        fclose(staging);
+        return false;
+    }
+    //a buffered write error may only surface now: the staged content must be complete
+    if (fflush(staging)!=0 || ferror(staging)) {
+        fclose(staging);
+        return false;
+    }
+
+    vector<libzippp_uint64> createdDirIndices;
+    if (!createParentDirectories(entryName, createdDirIndices)) {
+        fclose(staging);
+        return false;
+    }
+
+    IstreamSourceState* state = new (std::nothrow) IstreamSourceState;
+    if (state==nullptr) {
+        rollbackCreatedDirectories(createdDirIndices);
+        fclose(staging);
+        return false;
+    }
+    state->file = staging;
+    state->size = total;
+    state->offset = 0;
+    zip_error_init(&state->error);
+
+    zip_source* source = zip_source_function(zipHandle, istreamSourceCallback, state);
+    if (source==nullptr) {
+        delete state;
+        rollbackCreatedDirectories(createdDirIndices);
+        fclose(staging);
+        return false;
+    }
+
+    libzippp_uint64 index = 0;
+    if (!installPreparedSource(entryName, source, createdDirIndices, &index)) {
+        //the source (and its state) was released by the failed installation; the
+        //staging file is still ours
+        fclose(staging);
+        return false;
+    }
+
+    //a content previously staged from a stream for this very entry is not referenced
+    //anymore (its source was released by the overwrite): close its staging file so
+    //that successive overwrites of the same entry never leak
+    forgetStagedStreamFile(index);
+    stagedStreamFiles[index] = staging;
     return true;
 }
 

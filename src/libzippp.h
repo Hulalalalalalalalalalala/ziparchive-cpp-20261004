@@ -39,6 +39,7 @@
 #include <cstdint>
 #endif
 #include <cstdio>
+#include <istream>
 #include <map>
 #include <memory>
 #include <string>
@@ -580,6 +581,40 @@ namespace libzippp {
          * If the zip file is not open, this method returns false.
          */
         bool addData(const std::string& entryName, const std::basic_string<libzippp_uint8> data) const;
+
+        /**
+         * Adds the content read from the given input stream to the specified entry name
+         * in the archive. If the entry already exists, its content will be erased.
+         * If the entryName contains folders that don't exist in the archive, they will be automatically created.
+         * If the entryName denotes a directory (or is empty), this method returns false.
+         * If the zip file is not open or is read-only, this method returns false.
+         *
+         * The content is read from the current position of the stream to its normal end;
+         * the stream does not need to be seekable and its length does not need to be known
+         * in advance. Every byte is stored as binary content (zero bytes included) and an
+         * already exhausted stream simply writes an empty file. The content is staged
+         * through a temporary file, so the memory footprint of this method does not grow
+         * with the length of the stream. If chunksize is zero, it defaults to
+         * LIBZIPPP_DEFAULT_CHUNK_SIZE (512KB).
+         *
+         * When true is returned, the whole content has been received and staged: the
+         * stream may be closed or destroyed immediately, reading the entry (Current
+         * state) and committing the changes no longer depend on it. A true return value
+         * only means the change is staged: it is written back to the archive by close().
+         *
+         * The addition is atomic, exactly like addFile: on failure the archive is left
+         * exactly as it was before the call (no new entry, no half-written content, no
+         * empty parent directory, no fallback to default compression or no encryption)
+         * and stays open and usable. An exception thrown by the stream at its normal
+         * end (eofbit/failbit) is treated as a completed read; any other read error or
+         * exception makes this method return false (nothing is propagated to the
+         * caller). The bytes already consumed from the stream are not put back, the
+         * stream is never closed by this method and its exception mask is left
+         * untouched. When the archive is not open, is read-only, the entry name is
+         * invalid or the selected compression/encryption is not applicable, false is
+         * returned without consuming anything from the stream.
+         */
+        bool addData(const std::string& entryName, std::istream& input, libzippp_uint64 chunksize=LIBZIPPP_DEFAULT_CHUNK_SIZE) const;
         
         /**
          * Adds the specified entry to the ZipArchive. All the needed hierarchy will be created.
@@ -709,6 +744,25 @@ namespace libzippp {
         void releaseAdoptedBuffers(void);
 
         /*
+         * Temporary files staging the content of the entries written through
+         * addData(..., std::istream&). Each entry staged that way is backed by a
+         * tmpfile() (automatically removed by the operating system when closed)
+         * that the custom zip_source of the entry reads from; the FILE* itself is
+         * owned by the archive, never by the source. The map is keyed by the
+         * (stable) libzip index of the entry, so it survives a rename. A file is
+         * closed exactly once: when its entry is overwritten or deleted, or when
+         * the pending changes are committed (close), abandoned (discard) or the
+         * archive is destroyed.
+         */
+        mutable std::map<libzippp_uint64, FILE*> stagedStreamFiles;
+
+        //closes and forgets every staging file (see stagedStreamFiles)
+        void releaseStagedStreamFiles(void);
+
+        //closes and forgets the staging file of the (deleted or replaced) entry, if any
+        void forgetStagedStreamFile(libzippp_uint64 index) const;
+
+        /*
          * Returns true if the compression/encryption method selected on the archive can
          * be applied by the underlying libzip. These checks are performed before any
          * modification so that an unsupported method fails without leaving any trace
@@ -739,10 +793,12 @@ namespace libzippp {
          * entry (overwriting any existing one) and applies the archive compression and
          * encryption settings; on failure the source is released (without freeing its
          * data), every change done by the call is reverted and false is returned.
+         * When addedIndex is not null and the call succeeds, it receives the (stable)
+         * libzip index the source was installed at.
          */
         bool createParentDirectories(const std::string& entryName, std::vector<libzippp_uint64>& createdDirIndices) const;
         void rollbackCreatedDirectories(const std::vector<libzippp_uint64>& createdDirIndices) const;
-        bool installPreparedSource(const std::string& entryName, zip_source* source, const std::vector<libzippp_uint64>& createdDirIndices) const;
+        bool installPreparedSource(const std::string& entryName, zip_source* source, const std::vector<libzippp_uint64>& createdDirIndices, libzippp_uint64* addedIndex=nullptr) const;
 
         //creates/destroys the open-session marker shared with the entries
         void beginEntrySession(void);
