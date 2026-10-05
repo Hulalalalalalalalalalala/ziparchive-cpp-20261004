@@ -118,6 +118,21 @@ static CompressionMethod convertCompressionFromLibzip(libzippp_uint16 comp) {
     }
 }
 
+/*
+ * libzip accepts any compression level (it is simply stored, not validated): the
+ * levels a method cannot use must be rejected here so that an invalid setting never
+ * reaches the archive. A zero level always means "the default behavior of libzip";
+ * for DEFLATE (and DEFAULT, which libzip maps to its default deflating behavior) the
+ * supported non-zero levels are 1 to 9. Note that ZIP_CM_DEFAULT (-1) is stored in
+ * an unsigned 16-bit value by libzippp, hence the cast.
+ */
+static bool isCompressionLevelApplicable(libzippp_uint16 comp, libzippp_uint32 level) {
+    if (comp==ZIP_CM_DEFLATE || comp==(libzippp_uint16)ZIP_CM_DEFAULT) {
+        return level<=9;
+    }
+    return true;
+}
+
 namespace Helper {
     static void callErrorHandlingCallbackFunc(const std::string& message, int zip_error_code, int system_error_code, ErrorHandlerCallback* callback) {
         zip_error_t error;
@@ -173,7 +188,7 @@ bool ZipEntry::setComment(const string& str) const {
 bool ZipEntry::setCompressionMethod(CompressionMethod compMethod) {
     if (isNull()) { return false; }
     if (session.expired()) { return false; }
-    return zipFile->setEntryCompressionConfig(*this, compMethod, compressionLevel);
+    return zipFile->setEntryCompressionMethod(*this, compMethod);
 }
 
 CompressionMethod ZipEntry::getCompressionMethod(void) const {
@@ -183,7 +198,7 @@ CompressionMethod ZipEntry::getCompressionMethod(void) const {
 bool ZipEntry::setCompressionLevel(libzippp_uint32 level) {
     if (isNull()) { return false; }
     if (session.expired()) { return false; }
-    return zipFile->setEntryCompressionConfig(*this, convertCompressionFromLibzip(compressionMethod), level);
+    return zipFile->setEntryCompressionLevel(*this, level);
 }
 
 string ZipEntry::readAsText(ZipArchive::State state, libzippp_uint64 size) const {
@@ -266,6 +281,9 @@ void ZipArchive::endEntrySession(void) {
     //releasing the last strong reference expires every weak_ptr held by the entries
     //obtained during this opening, including all their copies
     entrySession.reset();
+    //the compression settings tracked for the entries belong to the opening that
+    //just ended: a later opening must not inherit them
+    entryCompressionConfigs.clear();
 }
 
 bool ZipArchive::isEntryUsable(const ZipEntry& entry) const {
@@ -627,12 +645,57 @@ bool ZipArchive::setEntryCompressionConfig(ZipEntry& entry, CompressionMethod co
     if (mode==ReadOnly) { return false; }
     const libzippp_uint16 comp_libzip = convertCompressionToLibzip(comp);
 
-    bool success = zip_set_file_compression(zipHandle, entry.index, comp_libzip, level)==0;
+    //libzip does not validate the compression level: reject here the levels the
+    //selected method cannot use, so that neither the entry nor the archive is changed
+    if (!isCompressionLevelApplicable(comp_libzip, level)) { return false; }
+
+    //ZIP_CM_DEFAULT (-1) is stored in an unsigned 16-bit value: sign-extend it back
+    //for libzip, which rejects the truncated 65535 as an unknown method
+    bool success = zip_set_file_compression(zipHandle, entry.index, (zip_int32_t)(zip_int16_t)comp_libzip, level)==0;
     if (success) {
         entry.compressionMethod = comp_libzip;
         entry.compressionLevel = level;
+        //tracked for the whole opening so that Current-state queries (including of
+        //copies obtained later, e.g. after a rename) report these exact settings
+        entryCompressionConfigs[entry.index] = EntryCompressionConfig(comp_libzip, level);
     }
     return success;
+}
+
+bool ZipArchive::setEntryCompressionMethod(ZipEntry& entry, CompressionMethod comp) const {
+    if (!isOpen()) { return false; }
+    if (!isEntryUsable(entry)) { return false; }
+
+    //only the method changes: the level currently effective for the entry is
+    //preserved. It may have been chosen through another copy of the entry after
+    //this ZipEntry object was obtained, hence it is resolved from the settings
+    //tracked by the archive (0 means the default behavior of libzip) and never
+    //from the possibly stale value captured by this copy.
+    libzippp_uint32 level = 0;
+    std::map<libzippp_uint64, EntryCompressionConfig>::const_iterator it = entryCompressionConfigs.find(entry.index);
+    if (it!=entryCompressionConfigs.end()) { level = it->second.level; }
+    return setEntryCompressionConfig(entry, comp, level);
+}
+
+bool ZipArchive::setEntryCompressionLevel(ZipEntry& entry, libzippp_uint32 level) const {
+    if (!isOpen()) { return false; }
+    if (!isEntryUsable(entry)) { return false; }
+
+    //only the level changes: the method currently effective for the entry is
+    //preserved (see setEntryCompressionMethod)
+    libzippp_uint16 method;
+    std::map<libzippp_uint64, EntryCompressionConfig>::const_iterator it = entryCompressionConfigs.find(entry.index);
+    if (it!=entryCompressionConfigs.end()) {
+        method = it->second.method;
+    } else {
+        //no compression change is pending for this entry: its effective method is
+        //the one of the current state of the archive
+        struct zip_stat stat;
+        zip_stat_init(&stat);
+        if (zip_stat_index(zipHandle, entry.index, ZIP_FL_ENC_GUESS, &stat)!=0) { return false; }
+        method = stat.comp_method;
+    }
+    return setEntryCompressionConfig(entry, convertCompressionFromLibzip(method), level);
 }
 
 libzippp_int64 ZipArchive::getNbEntries(State state) const {
@@ -642,22 +705,31 @@ libzippp_int64 ZipArchive::getNbEntries(State state) const {
     return zip_get_num_entries(zipHandle, flag);
 }
 
-ZipEntry ZipArchive::createEntry(struct zip_stat* stat) const {
+ZipEntry ZipArchive::createEntry(struct zip_stat* stat, State state) const {
     string name(stat->name);
     libzippp_uint64 index = stat->index;
     libzippp_uint64 size = stat->size;
-    libzippp_uint16 compMethod;
-    if (useArchiveCompressionMethod) {
-        compMethod = this->compressionMethod;
-    } else {
-        compMethod = stat->comp_method;
+    //the compression method of an entry is always its own: the default method
+    //selected on the archive only applies to the entries added afterwards and must
+    //never mask the method of an existing (or already staged) entry
+    libzippp_uint16 compMethod = stat->comp_method;
+    //libzip does not expose the compression level of an entry: it is only known for
+    //the settings explicitly chosen during this opening (tracked by index). The
+    //original state never borrows a level set afterwards.
+    libzippp_uint32 compLevel = 0;
+    if (state==Current) {
+        std::map<libzippp_uint64, EntryCompressionConfig>::const_iterator it = entryCompressionConfigs.find(index);
+        if (it!=entryCompressionConfigs.end()) {
+            compMethod = it->second.method;
+            compLevel = it->second.level;
+        }
     }
     libzippp_uint16 encMethod = stat->encryption_method;
     libzippp_uint64 sizeComp = stat->comp_size;
     int crc = stat->crc;
     time_t time = stat->mtime;
 
-    return ZipEntry(this, entrySession, name, index, time, compMethod, compressionLevel, encMethod, size, sizeComp, crc);
+    return ZipEntry(this, entrySession, name, index, time, compMethod, compLevel, encMethod, size, sizeComp, crc);
 }
 
 int ZipArchive::stateFlags(State state) {
@@ -680,7 +752,7 @@ ZipEntry ZipArchive::resolveEntry(const ZipEntry& zipEntry, State state, libzipp
     //current state (read with Current) or a newly added entry (read with Original)
     if (zip_stat_index(zipHandle, zipEntry.getIndex(), flag, &stat)!=0) { return ZipEntry(); }
 
-    ZipEntry resolved = createEntry(&stat);
+    ZipEntry resolved = createEntry(&stat, state);
     if (outSize!=nullptr) { *outSize = stat.size; }
     return resolved;
 }
@@ -697,7 +769,7 @@ vector<ZipEntry> ZipArchive::getEntries(State state) const {
     for(libzippp_int64 i=0 ; i<nbEntries ; ++i) {
         int result = zip_stat_index(zipHandle, i, flag, &stat);
         if (result==0) {
-            ZipEntry entry = createEntry(&stat);
+            ZipEntry entry = createEntry(&stat, state);
             entries.push_back(entry);
         } else {
             //TODO handle read error => crash ?
@@ -747,7 +819,7 @@ ZipEntry ZipArchive::getEntry(libzippp_int64 index, State state) const {
         int flag = state==Original ? LIBZIPPP_ORIGINAL_STATE_FLAGS : ZIP_FL_ENC_GUESS;
         int result = zip_stat_index(zipHandle, index, flag, &stat);
         if (result==0) {
-            return createEntry(&stat);
+            return createEntry(&stat, state);
         } else {
             //index not found / invalid index
         }
@@ -1049,9 +1121,13 @@ void ZipArchive::releaseAdoptedBuffers(void) {
 }
 
 bool ZipArchive::isArchiveCompressionApplicable(void) const {
-    if (!useArchiveCompressionMethod) { return true; }
+    if (!useArchiveCompressionMethod && compressionLevel==0) { return true; }
+    //libzip does not validate the compression level: an out-of-range level for the
+    //selected method must be rejected here, before anything is changed
+    if (!isCompressionLevelApplicable(compressionMethod, compressionLevel)) { return false; }
 #ifdef LIBZIPPP_HAS_COMPRESSION_METHOD_SUPPORTED
-    return zip_compression_method_supported(compressionMethod, 1)!=0;
+    //ZIP_CM_DEFAULT (-1) is stored in an unsigned 16-bit member: sign-extend it back
+    return zip_compression_method_supported((zip_int32_t)(zip_int16_t)compressionMethod, 1)!=0;
 #else
     //cannot be checked beforehand: a failure is rolled back after the addition
     return true;
@@ -1113,8 +1189,17 @@ bool ZipArchive::installPreparedSource(const string& entryName, zip_source* sour
     zip_file_set_mtime(zipHandle, result, time(nullptr), 0);
 
     bool settingsApplied = true;
-    if (useArchiveCompressionMethod) {
-        settingsApplied = zip_set_file_compression(zipHandle, result, compressionMethod, 0)==0;
+    if (useArchiveCompressionMethod || compressionLevel!=0) {
+        //the archive defaults are part of the actual write: both the method and the
+        //level are applied (a zero level keeps the default behavior of libzip). The
+        //int16 round-trip sign-extends ZIP_CM_DEFAULT (-1) back from its unsigned
+        //16-bit storage, which libzip would reject as an unknown method.
+        settingsApplied = zip_set_file_compression(zipHandle, result, (zip_int32_t)(zip_int16_t)compressionMethod, compressionLevel)==0;
+        if (settingsApplied) {
+            //tracked so that Current-state queries of the new entry report the
+            //settings it will be written with (libzip does not expose the level)
+            entryCompressionConfigs[(libzippp_uint64)result] = EntryCompressionConfig(compressionMethod, compressionLevel);
+        }
     }
 #ifdef LIBZIPPP_WITH_ENCRYPTION
     if (settingsApplied && isEncrypted()) {

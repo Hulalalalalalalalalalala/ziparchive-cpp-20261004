@@ -39,6 +39,7 @@
 #include <cstdint>
 #endif
 #include <cstdio>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -420,6 +421,10 @@ namespace libzippp {
         /**
          * Defines the compression method of an entry. If the ZipArchive is not open
          * or the entry is not linked to this archive, false will be returned.
+         * Both settings are applied at once; on success the given ZipEntry reflects
+         * them. A call rejected by libzip (e.g. a compression level the method does
+         * not support) returns false and leaves both the entry and the archive
+         * unchanged.
          **/
         bool setEntryCompressionConfig(ZipEntry& entry, CompressionMethod compMethod=CompressionMethod::DEFAULT, libzippp_uint32 compLevel=0) const;
         
@@ -641,20 +646,30 @@ namespace libzippp {
         }
 
         /**
-         * Defines the compression method to used for the newly created ZipEntry.
+         * Defines the default compression method used for the entries added or
+         * overwritten from now on (see addFile/addData): it is part of the actual
+         * write, together with the default compression level. This default never
+         * changes the entries already present or staged in the archive and never
+         * masks their own compression method. CompressionMethod::DEFAULT restores
+         * the default behavior of libzip.
          */
         void setCompressionMethod(CompressionMethod comp);
         CompressionMethod getCompressionMethod(void) const;
 
         /**
-         * Defines the compression level to use. By default this value is zero to use the default behaviour of libzip.
-         * Otherwise, this value should be between 1 and 9, 1 being the fastest compression and 9 the best.
+         * Defines the default compression level used for the entries added or
+         * overwritten from now on. By default this value is zero to use the default
+         * behaviour of libzip. Otherwise, this value should be between 1 and 9, 1
+         * being the fastest compression and 9 the best.
          * For ZSTD, possible values are defined by ZSTD_minCLevel and ZSTD_maxCLevel.
+         * Like the default method, this never affects the existing entries.
          */
         inline void setCompressionLevel(libzippp_uint32 level) { this->compressionLevel = level; }
         inline libzippp_uint32 getCompressionLevel(void) const { return compressionLevel; }
 
     private:
+        friend class ZipEntry;
+
         std::string path;
         zip* zipHandle;
         zip_source* zipSource;
@@ -676,6 +691,23 @@ namespace libzippp {
 
         //open-session marker shared with every ZipEntry created by this opening
         std::shared_ptr<ZipEntrySession> entrySession;
+
+        /*
+         * Compression settings explicitly chosen for an entry during the current
+         * opening, keyed by its (stable) libzip index. libzip does not expose the
+         * compression level of an entry through zip_stat, so the settings selected
+         * through the entry-level API (and the archive defaults applied to newly
+         * added entries) are tracked here and reported by Current-state queries,
+         * including for entries re-obtained later (e.g. after a rename). The map is
+         * reset when the opening ends: nothing is carried over to a later opening.
+         */
+        struct EntryCompressionConfig {
+            libzippp_uint16 method;
+            libzippp_uint32 level;
+            EntryCompressionConfig() : method(0), level(0) {}
+            EntryCompressionConfig(libzippp_uint16 m, libzippp_uint32 l) : method(m), level(l) {}
+        };
+        mutable std::map<libzippp_uint64, EntryCompressionConfig> entryCompressionConfigs;
 
         /*
          * Buffers adopted through addData(..., freeData=true). The data is always handed
@@ -726,12 +758,22 @@ namespace libzippp {
          */
         bool isEntryUsable(const ZipEntry& entry) const;
 
+        /*
+         * Entry-level compression entry points used by ZipEntry::setCompressionMethod
+         * and ZipEntry::setCompressionLevel: each one changes a single setting and
+         * preserves the other one as it is currently effective for the entry (it may
+         * have been chosen through another copy of the entry after this ZipEntry
+         * object was obtained). setEntryCompressionConfig sets both at once.
+         */
+        bool setEntryCompressionMethod(ZipEntry& entry, CompressionMethod comp) const;
+        bool setEntryCompressionLevel(ZipEntry& entry, libzippp_uint32 level) const;
+
         //open from in-memory data
         bool openBuffer(void** buffer, libzippp_uint32 sz, OpenMode mode=ReadOnly, bool checkConsistency=false);
         bool openSource(zip_source* source, OpenMode mode=ReadOnly, bool checkConsistency=false);
         
         //generic method to create ZipEntry
-        ZipEntry createEntry(struct zip_stat* stat) const;
+        ZipEntry createEntry(struct zip_stat* stat, State state) const;
 
         //converts the logical state into the flags used by libzip
         static int stateFlags(State state);
@@ -815,14 +857,20 @@ namespace libzippp {
         /**
          * Defines the compression method to be used. By default, ZIP_CM_DEFAULT.
          * Can be one of ZIP_CM_DEFAULT,ZIP_CM_STORE,ZIP_CM_BZIP2,ZIP_CM_DEFLATE,ZIP_CM_XZ or ZIP_CM_ZSTD.
+         * Changing the method preserves the compression level currently effective for
+         * the entry, even if it was chosen through another copy of this entry.
          */
         CompressionMethod getCompressionMethod(void) const;
         bool setCompressionMethod(CompressionMethod compMethod);
-        
+
         /**
          * Defines the compression level to use. By default this value is zero to use the default behaviour of libzip.
          * Otherwise, this value should be between 1 and 9, 1 being the fastest compression and 9 the best.
          * For ZSTD, possible values are defined by ZSTD_minCLevel and ZSTD_maxCLevel.
+         * The level read back from an existing archive is 0, since libzip does not expose
+         * it; a level explicitly chosen during the current opening is reported as is.
+         * Changing the level preserves the compression method currently effective for
+         * the entry, even if it was chosen through another copy of this entry.
          */
         inline libzippp_uint32 getCompressionLevel(void) const { return compressionLevel; }
         bool setCompressionLevel(libzippp_uint32 level);
