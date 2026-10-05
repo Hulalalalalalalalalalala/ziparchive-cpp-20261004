@@ -40,6 +40,7 @@
 #include <zip.h>
 #include <errno.h>
 #include <algorithm>
+#include <cstring>
 #include <fstream>
 #include <memory>
 
@@ -261,6 +262,10 @@ bool ZipArchive::isEntryUsable(const ZipEntry& entry) const {
 ZipArchive::~ZipArchive(void) {
     close(); /* discard ??? */
 
+    //if close() could not commit, the opening is abandoned here: the buffers transferred
+    //by addData(..., freeData=true) are still the archive's responsibility
+    releaseOwnedBuffers();
+
     //whatever close() did (including a failed commit), the archive object itself is
     //gone: every entry obtained from any opening must be expired now
     endEntrySession();
@@ -472,6 +477,9 @@ int ZipArchive::close(void) {
         //the opening really ended (even if the buffer readback below fails afterwards):
         //all entries obtained during it must expire now
         endEntrySession();
+        //the commit consumed the sources: release the buffers whose ownership was
+        //transferred to the archive by addData(..., freeData=true)
+        releaseOwnedBuffers();
         progress_callback(zipHandle, 1, this); //enforce the last progression call to be one
 
         //push back the changes in the buffer
@@ -552,6 +560,9 @@ void ZipArchive::discard(void) {
     if (isOpen()) {
         zip_discard(zipHandle);
         zipHandle = nullptr;
+        //the pending sources are gone: release the buffers transferred by
+        //addData(..., freeData=true) during this opening
+        releaseOwnedBuffers();
 
         if (bufferData!=nullptr && (mode==New || mode==Write)) {
             zip_source_free(zipSource);
@@ -1012,95 +1023,180 @@ int ZipArchive::renameEntry(const string& e, const string& newName) const {
     return renameEntry(entry, newName);
 }
 
+bool ZipArchive::canApplyCompressionAndEncryption(void) const {
+    //same checks as zip_set_file_compression()/zip_file_set_encryption() will perform
+    if (useArchiveCompressionMethod && !zip_compression_method_supported(compressionMethod, 1)) { return false; }
+#ifdef LIBZIPPP_WITH_ENCRYPTION
+    //zip_file_set_encryption() does not require ZIP_EM_NONE to be supported
+    if (isEncrypted() && encryptionMethod!=ZIP_EM_NONE && !zip_encryption_method_supported((zip_uint16_t)encryptionMethod, 1)) { return false; }
+#endif
+    return true;
+}
+
+bool ZipArchive::applyCompressionAndEncryption(libzippp_uint64 index) const {
+    if (useArchiveCompressionMethod) {
+        if (zip_set_file_compression(zipHandle, index, compressionMethod, 0)!=0) { return false; }
+    }
+#ifdef LIBZIPPP_WITH_ENCRYPTION
+    if (isEncrypted()) {
+        if (zip_file_set_encryption(zipHandle, index, encryptionMethod, nullptr)!=0) { return false; } //unable to encrypt
+    }
+#endif
+    return true;
+}
+
+bool ZipArchive::createMissingDirectories(const string& entryName, vector<libzippp_uint64>& createdDirIndices) const {
+    string::size_type lastSlash = entryName.rfind(LIBZIPPP_ENTRY_PATH_SEPARATOR);
+    if (lastSlash==string::npos) { return true; } //no parent directory needed
+
+    string dirEntry = entryName.substr(0, lastSlash+1);
+    string::size_type nextSlash = dirEntry.find(LIBZIPPP_ENTRY_PATH_SEPARATOR);
+    while (nextSlash!=string::npos) {
+        string pathToCreate = dirEntry.substr(0, nextSlash+1);
+        if (!hasEntry(pathToCreate)) {
+            libzippp_int64 result = zip_dir_add(zipHandle, pathToCreate.c_str(), ZIP_FL_ENC_GUESS);
+            if (result<0) { return false; }
+            createdDirIndices.push_back((libzippp_uint64)result);
+        }
+        nextSlash = dirEntry.find(LIBZIPPP_ENTRY_PATH_SEPARATOR, nextSlash+1);
+    }
+    return true;
+}
+
+void ZipArchive::rollbackCreatedDirectories(const vector<libzippp_uint64>& createdDirIndices) const {
+    //deepest first, and only what the failed call created: pre-existing directories
+    //and any other pending change are left untouched
+    for(vector<libzippp_uint64>::const_reverse_iterator it=createdDirIndices.rbegin() ; it!=createdDirIndices.rend() ; ++it) {
+        zip_unchange(zipHandle, *it);
+    }
+}
+
+void ZipArchive::releaseOwnedBuffers(void) {
+    for(vector<void*>::iterator it=ownedBuffers.begin() ; it!=ownedBuffers.end() ; ++it) {
+        ::free(*it);
+    }
+    ownedBuffers.clear();
+}
+
 bool ZipArchive::addFile(const string& entryName, const string& file) const {
     if (!isOpen()) { return false; }
     if (mode==ReadOnly) { return false; } //adding not allowed
     if (LIBZIPPP_ENTRY_IS_DIRECTORY(entryName)) { return false; }
 
-    string::size_type lastSlash = entryName.rfind(LIBZIPPP_ENTRY_PATH_SEPARATOR);
-    if (lastSlash!=string::npos) { //creates the needed parent directories
-        string dirEntry = entryName.substr(0, lastSlash+1);
-        bool dadded = addEntry(dirEntry);
-        if (!dadded) { return false; }
-    }
+    /*
+     * Everything that can foreseeably make this call fail is checked BEFORE the archive
+     * is modified, so that a failure leaves the archive (including its uncommitted
+     * changes) exactly as it was: no new entry, no freshly created parent directory, and
+     * no silent fallback to the default compression or to no encryption.
+     */
+    if (!canApplyCompressionAndEncryption()) { return false; }
+
+    //zip_source_file() opens the file lazily (at commit time): its existence must be
+    //checked explicitly here so that a missing source file fails the call itself
+    FILE* sourceFile = fopen(file.c_str(), "rb");
+    if (sourceFile==nullptr) { return false; }
+    fclose(sourceFile);
 
     const char* filepath = file.c_str();
     zip_source* source = zip_source_file(zipHandle, filepath, 0, -1);
-    if (source!=nullptr) {
-        libzippp_int64 result = zip_file_add(zipHandle, entryName.c_str(), source, ZIP_FL_OVERWRITE);
-        if (result>=0) {
-            zip_file_set_mtime(zipHandle, result, time(nullptr), 0);
-            if (useArchiveCompressionMethod) {
-              zip_set_file_compression(zipHandle, result, compressionMethod, 0);
-            }
-#ifdef LIBZIPPP_WITH_ENCRYPTION
-            if (isEncrypted()) {
-                if (zip_file_set_encryption(zipHandle,result,encryptionMethod,nullptr)!=0) { //unable to encrypt
-                    zip_source_free(source);
-                } else {
-                    return true;
-                }
-            } else {
-                return true;
-            }
-#else
-            return true;
-#endif
-        } else {
-            //unable to add the file
-            zip_source_free(source);
-        }
-    } else {
-        //unable to create the zip_source
+    if (source==nullptr) { return false; } //unable to create the zip_source
+
+    vector<libzippp_uint64> createdDirIndices;
+    if (!createMissingDirectories(entryName, createdDirIndices)) {
+        rollbackCreatedDirectories(createdDirIndices);
+        zip_source_free(source);
+        return false;
     }
-    return false;
+
+    libzippp_int64 result = zip_file_add(zipHandle, entryName.c_str(), source, ZIP_FL_OVERWRITE);
+    if (result<0) {
+        //unable to add the file: the source is still owned by this call
+        rollbackCreatedDirectories(createdDirIndices);
+        zip_source_free(source);
+        return false;
+    }
+
+    //from here on, the source is owned by the archive
+    zip_file_set_mtime(zipHandle, result, time(nullptr), 0);
+    if (!applyCompressionAndEncryption(result)) {
+        /*
+         * Not reachable once canApplyCompressionAndEncryption() passed, short of memory
+         * exhaustion: undo the whole add. Note that zip_unchange() reverts the entry to
+         * its state on disk, so prior uncommitted changes to this very entry would be
+         * lost as well; libzip offers no way to restore them.
+         */
+        zip_unchange(zipHandle, result);
+        rollbackCreatedDirectories(createdDirIndices);
+        return false;
+    }
+    return true;
 }
 
 bool ZipArchive::addData(const string& entryName, const void* data, libzippp_uint64 length, bool freeData) const {
     if (!isOpen()) { return false; }
     if (mode==ReadOnly) { return false; } //adding not allowed
     if (LIBZIPPP_ENTRY_IS_DIRECTORY(entryName)) { return false; }
+    if (data==nullptr && length>0) { return false; } //a null buffer is only allowed for an empty entry
 
-    string::size_type lastSlash = entryName.rfind(LIBZIPPP_ENTRY_PATH_SEPARATOR);
-    if (lastSlash!=string::npos) { //creates the needed parent directories
-        string dirEntry = entryName.substr(0, lastSlash+1);
-        bool dadded = addEntry(dirEntry);
-        if (!dadded) { return false; }
+    //see addFile: every foreseeable failure happens before the archive is modified
+    if (!canApplyCompressionAndEncryption()) { return false; }
+
+    /*
+     * The source is ALWAYS created with freep=0 so that libzip never frees the buffer:
+     * - if this call fails, the buffer still belongs to the caller, who may free it
+     *   immediately (no remaining source references it)
+     * - if it succeeds with freeData=true, the archive takes the ownership over and
+     *   releases the buffer exactly once when this opening ends (see ownedBuffers)
+     */
+    zip_source* source = zip_source_buffer(zipHandle, data, length, 0);
+    if (source==nullptr) { return false; } //unable to create the zip_source
+
+    vector<libzippp_uint64> createdDirIndices;
+    if (!createMissingDirectories(entryName, createdDirIndices)) {
+        rollbackCreatedDirectories(createdDirIndices);
+        zip_source_free(source);
+        return false;
     }
 
-    zip_source* source = zip_source_buffer(zipHandle, data, length, freeData);
-    if (source!=nullptr) {
-        libzippp_int64 result = zip_file_add(zipHandle, entryName.c_str(), source, ZIP_FL_OVERWRITE);
-        if (result>=0) {
-            zip_file_set_mtime(zipHandle, result, time(nullptr), 0);
-            if (useArchiveCompressionMethod) {
-              zip_set_file_compression(zipHandle, result, compressionMethod, 0);
-            }
-#ifdef LIBZIPPP_WITH_ENCRYPTION
-            if (isEncrypted()) {
-                if (zip_file_set_encryption(zipHandle,result,encryptionMethod,nullptr)!=0) { //unable to encrypt
-                    zip_source_free(source);
-                } else {
-                    return true;
-                }
-            } else {
-                return true;
-            }
-#else
-            return true;
-#endif
-        } else {
-            //unable to add the file
-            zip_source_free(source);
-        }
-    } else {
-        //unable to create the zip_source
+    libzippp_int64 result = zip_file_add(zipHandle, entryName.c_str(), source, ZIP_FL_OVERWRITE);
+    if (result<0) {
+        //unable to add the data: the source is still owned by this call (freep=0,
+        //so freeing it does not touch the caller's buffer)
+        rollbackCreatedDirectories(createdDirIndices);
+        zip_source_free(source);
+        return false;
     }
-    return false;
+
+    //from here on, the source is owned by the archive
+    zip_file_set_mtime(zipHandle, result, time(nullptr), 0);
+    if (!applyCompressionAndEncryption(result)) {
+        //see addFile: not reachable once canApplyCompressionAndEncryption() passed
+        zip_unchange(zipHandle, result);
+        rollbackCreatedDirectories(createdDirIndices);
+        return false;
+    }
+
+    if (freeData) { ownedBuffers.push_back(const_cast<void*>(data)); }
+    return true;
 }
 
 bool ZipArchive::addData(const std::string& entryName, const std::basic_string<libzippp_uint8> data) const {
-    return addData(entryName, data.data(), data.size(), false);
+    /*
+     * The given string is a copy that is destroyed when this method returns, while the
+     * data must remain valid until the changes are committed or rolled back: it is
+     * copied into a freeable buffer whose ownership is transferred to the archive on
+     * success (and reclaimed here on failure, since a failed addData leaves the
+     * ownership to the caller).
+     */
+    if (data.empty()) { return addData(entryName, nullptr, 0, false); }
+    void* copy = malloc(data.size());
+    if (copy==nullptr) { return false; }
+    memcpy(copy, data.data(), data.size());
+    if (!addData(entryName, copy, data.size(), true)) {
+        ::free(copy);
+        return false;
+    }
+    return true;
 }
 
 bool ZipArchive::addEntry(const string& entryName) const {
