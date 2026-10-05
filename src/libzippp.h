@@ -482,11 +482,21 @@ namespace libzippp {
         /**
          * Deletes the specified entry from the zip file. If the entry is a folder, all its
          * subentries will be removed. This method returns the number of entries removed.
-         * If the open mode does not allow a deletion, this method will return LIBZIPPP_ERROR_NOT_ALLOWED. 
-         * If the ZipArchive is not open, LIBZIPPP_ERROR_NOT_OPEN will be returned. If the entry is not handled 
+         * If the open mode does not allow a deletion, this method will return LIBZIPPP_ERROR_NOT_ALLOWED.
+         * If the ZipArchive is not open, LIBZIPPP_ERROR_NOT_OPEN will be returned. If the entry is not handled
          * by this ZipArchive or is a null-ZipEntry, then LIBZIPPP_ERROR_INVALID_ENTRY will be returned.
          * If an error occurs during deletion, this method will return LIBZIPPP_ERROR_UNKNOWN.
          * Note that this method does not affect the result returned by getNbEntries !
+         *
+         * The entry is identified by the (stable) libzip slot captured when the ZipEntry was
+         * obtained from this opening, not by the name stored in the object: the same object (and
+         * any copy of it) keeps operating on that very entry after it was renamed, possibly
+         * several times, and even when its former name was reused by a newly added entry. If that
+         * entry has already been deleted, LIBZIPPP_ERROR_INVALID_ENTRY is returned and the entry
+         * reusing the old name is left untouched. For a directory, the removed subentries are the
+         * ones it contains in the CURRENT state, under its current name: entries moved into it
+         * after a rename are removed as well, entries moved out or already deleted are not, and
+         * directories with a similar name are unaffected.
          */
         int deleteEntry(const ZipEntry& entry) const;
         
@@ -519,6 +529,16 @@ namespace libzippp {
          * directory below its own path is supported (e.g. a/ to a/b/).
          * If the ZipArchive is not open or the entry was not edited by this ZipArchive or is a null-ZipEntry,
          * then LIBZIPPP_ERROR_INVALID_ENTRY will be returned.
+         *
+         * The ZipEntry overload always operates on the entry the object was obtained for: its
+         * (stable) libzip slot is the identity, so the object (and any copy of it) does not have
+         * to be fetched again after a rename, even when its former name is later reused by a
+         * newly added entry. If that entry was deleted, LIBZIPPP_ERROR_INVALID_ENTRY is returned
+         * and every pending modification is preserved; renaming it to the name it currently has
+         * returns LIBZIPPP_ERROR_INVALID_PARAMETER. Which entries follow a moved directory is
+         * determined against the CURRENT state at call time: entries moved in after the object
+         * was obtained move too, entries moved out or deleted do not, and directories with a
+         * similar name stay untouched. The by-name overload keeps the existing behavior.
          */
         int renameEntry(const ZipEntry& entry, const std::string& newName) const;
 
@@ -837,6 +857,25 @@ namespace libzippp {
          * to the uncompressed size of the entry in the given state.
          */
         ZipEntry resolveEntry(const ZipEntry& zipEntry, State state, libzippp_uint64* outSize) const;
+
+        /*
+         * Resolves the CURRENT name of the entry represented by a ZipEntry obtained during
+         * this opening. The (stable) libzip slot index carried by the entry is the entry's
+         * identity: it is stat'd in the current state, ignoring the possibly outdated name
+         * captured when the object was obtained. On success the current name is written to
+         * currentName and true is returned. Returns false when the slot no longer exists in
+         * the current state (the entry was deleted), in which case no error code is emitted
+         * and the caller reports LIBZIPPP_ERROR_INVALID_ENTRY - even when a newly added
+         * entry happens to reuse the name the object was obtained with (deleted slots are
+         * never recycled by libzip, so that new entry has a different index and is never
+         * the entry represented by this object).
+         */
+        bool resolveEntryCurrentName(const ZipEntry& entry, std::string& currentName) const;
+
+        //true if name starts with prefix and the first character after the prefix is a
+        //new path segment separator (or the prefix itself ends with one): the entry is a
+        //strict descendant of prefix, which must end with '/'
+        static bool isPathDescendant(const std::string& name, const std::string& prefix);
 
         //prevent copy across functions
         ZipArchive(const ZipArchive& zf);

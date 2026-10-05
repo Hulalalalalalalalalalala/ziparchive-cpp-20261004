@@ -1048,12 +1048,40 @@ void* ZipArchive::readEntry(const string& zipEntry, bool asText, State state, li
     return readEntry(entry, asText, state, size);
 }
 
+bool ZipArchive::isPathDescendant(const string& name, const string& prefix) {
+    //prefix always ends with '/', which is part of the compared prefix: the segment
+    //boundary is therefore enforced for free ("ab/" does not start with "a/")
+    return name.compare(0, prefix.length(), prefix)==0;
+}
+
+bool ZipArchive::resolveEntryCurrentName(const ZipEntry& entry, string& currentName) const {
+    struct zip_stat stat;
+    zip_stat_init(&stat);
+    //a deleted slot is reported with a null name / failing stat even when a newly added
+    //entry reuses the name captured by the object: the slot index is the identity
+    if (zip_stat_index(zipHandle, entry.getIndex(), ZIP_FL_ENC_GUESS, &stat)!=0) { return false; }
+    if (stat.name==nullptr || stat.name[0]=='\0') { return false; }
+    currentName = stat.name;
+    return true;
+}
+
 int ZipArchive::deleteEntry(const ZipEntry& entry) const {
     if (!isOpen()) { return LIBZIPPP_ERROR_NOT_OPEN; }
     if (!isEntryUsable(entry)) { return LIBZIPPP_ERROR_INVALID_ENTRY; }
     if (mode==ReadOnly) { return LIBZIPPP_ERROR_NOT_ALLOWED; } //deletion not allowed
 
-    if (entry.isFile()) {
+    /*
+     * The entry is identified by its (stable) libzip slot index, not by the name captured
+     * in the object: it may have been renamed (possibly several times) through this or
+     * another copy of the object, and its old name may even be reused by a newly added
+     * entry. Resolve what this slot is called in the CURRENT state. If the slot was
+     * deleted, the entry this object represents is gone even if its old name is occupied
+     * again: the new entry must not be touched.
+     */
+    string currentName;
+    if (!resolveEntryCurrentName(entry, currentName)) { return LIBZIPPP_ERROR_INVALID_ENTRY; }
+
+    if (!LIBZIPPP_ENTRY_IS_DIRECTORY(currentName)) {
         int result = zip_delete(zipHandle, entry.getIndex());
         if (result==0) {
             forgetEntryCompressionConfig(entry.getIndex());
@@ -1062,17 +1090,23 @@ int ZipArchive::deleteEntry(const ZipEntry& entry) const {
         }
         return LIBZIPPP_ERROR_UNKNOWN; //unable to delete the entry
     } else {
+        /*
+         * Directory deletion: which entries belong to the directory is evaluated against
+         * the CURRENT state and the current name of the directory. Entries added after a
+         * move take part, entries moved out or already deleted do not, and entries with a
+         * merely similar name (e.g. "ab/" when deleting "a/") are left untouched.
+         */
         int counter = 0;
-        vector<ZipEntry> allEntries = getEntries();
-        vector<ZipEntry>::const_iterator eit;
-        for(eit=allEntries.begin() ; eit!=allEntries.end() ; ++eit) {
-            ZipEntry ze = *eit;
-            string::size_type startPosition = ze.getName().find(entry.getName());
-            if (startPosition==0) {
-                int result = zip_delete(zipHandle, ze.getIndex());
+        zip_int64_t nbSlots = zip_get_num_entries(zipHandle, 0);
+        for(zip_int64_t i=0 ; i<nbSlots ; ++i) {
+            const char* name = zip_get_name(zipHandle, (zip_uint64_t)i, ZIP_FL_ENC_GUESS);
+            if (name==nullptr) { continue; } //entry deleted in the current (uncommitted) state
+            string entryName(name);
+            if (entryName==currentName || isPathDescendant(entryName, currentName)) {
+                int result = zip_delete(zipHandle, (zip_uint64_t)i);
                 if (result==0) {
-                    forgetEntryCompressionConfig(ze.getIndex());
-                    forgetStagedStreamFile(ze.getIndex());
+                    forgetEntryCompressionConfig((libzippp_uint64)i);
+                    forgetStagedStreamFile((libzippp_uint64)i);
                     ++counter;
                 }
                 else { return LIBZIPPP_ERROR_UNKNOWN; } //unable to remove the current entry
@@ -1094,7 +1128,18 @@ int ZipArchive::renameEntry(const ZipEntry& entry, const string& newNameIn) cons
     if (mode==ReadOnly) { return LIBZIPPP_ERROR_NOT_ALLOWED; } //renaming not allowed
     if (newNameIn.length()==0) { return LIBZIPPP_ERROR_INVALID_PARAMETER; }
 
-    bool isDir = entry.isDirectory();
+    /*
+     * The entry is identified by its (stable) libzip slot index and operated under its
+     * CURRENT name: the name captured in the object may be outdated (the entry may have
+     * been renamed already, through this object or one of its copies) and the old name
+     * may even be reused by a newly added entry. If the slot was deleted, the entry this
+     * object represents is gone - the new entry using the same name must never be moved;
+     * LIBZIPPP_ERROR_INVALID_ENTRY is returned and every pending modification is kept.
+     */
+    string sourceName;
+    if (!resolveEntryCurrentName(entry, sourceName)) { return LIBZIPPP_ERROR_INVALID_ENTRY; }
+
+    bool isDir = LIBZIPPP_ENTRY_IS_DIRECTORY(sourceName);
     string newName = newNameIn;
     if (isDir) {
         //a '/' is automatically appended to the destination of a directory
@@ -1103,7 +1148,8 @@ int ZipArchive::renameEntry(const ZipEntry& entry, const string& newNameIn) cons
         if (LIBZIPPP_ENTRY_IS_DIRECTORY(newName)) { return LIBZIPPP_ERROR_INVALID_PARAMETER; } //a file cannot be renamed as a directory
     }
 
-    string sourceName = entry.getName();
+    //renaming to the name the entry currently has is invalid (its name at the time the
+    //object was obtained is irrelevant)
     if (newName==sourceName) { return LIBZIPPP_ERROR_INVALID_PARAMETER; }
 
     /*
@@ -1128,15 +1174,20 @@ int ZipArchive::renameEntry(const ZipEntry& entry, const string& newNameIn) cons
         bool participates = false;
         string targetName;
         if (isDir) {
-            if (name==sourceName) {
+            //the directory itself is matched by its slot index (authoritative identity);
+            //its current descendants are matched by current-name prefix, so entries moved
+            //in after the object was obtained take part and entries moved out do not
+            if ((zip_uint64_t)i==entry.getIndex()) {
                 participates = true;
                 targetName = newName;
-            } else if (name.compare(0, sourceName.length(), sourceName)==0) {
+            } else if (isPathDescendant(name, sourceName)) {
                 participates = true; //descendant of the moved directory
                 targetName = newName + name.substr(sourceName.length());
             }
         } else {
-            participates = (name==sourceName);
+            //only the slot the object refers to moves, never an entry that merely reuses
+            //its old name
+            participates = ((zip_uint64_t)i==entry.getIndex());
             targetName = newName;
         }
 
@@ -1147,10 +1198,11 @@ int ZipArchive::renameEntry(const ZipEntry& entry, const string& newNameIn) cons
         }
     }
 
-    //the source entry itself must be part of the current archive
+    //the source slot must still be present in the current archive (resolveEntryCurrentName
+    //already ensured this; re-check that the enumeration saw it)
     bool sourceFound = false;
     for(vector<RenameItem>::const_iterator it=movedItems.begin() ; it!=movedItems.end() ; ++it) {
-        if (it->oldName==sourceName) { sourceFound = true; break; }
+        if (it->index==entry.getIndex()) { sourceFound = true; break; }
     }
     if (!sourceFound) { return LIBZIPPP_ERROR_INVALID_ENTRY; }
 

@@ -2091,6 +2091,188 @@ void test36() {
     cout << " done." << endl;
 }
 
+/*
+ * A saved ZipEntry keeps designating the entry it was obtained for throughout the opening,
+ * even after that entry was renamed and even when its old name is reused by a newly added
+ * entry: renameEntry/deleteEntry (ZipEntry overload) anchor on the stable libzip slot, not
+ * on the name captured in the object. Copies of an entry share the same identity, so the
+ * object never has to be fetched again after a move. A deleted entry - even with its old
+ * name taken over - is reported as LIBZIPPP_ERROR_INVALID_ENTRY while all pending changes
+ * are preserved; renaming to the entry's current name is LIBZIPPP_ERROR_INVALID_PARAMETER;
+ * a destination conflict still returns LIBZIPPP_ERROR_UNKNOWN and leaves the archive in
+ * its pre-call state, after which the object remains usable. Which children follow a moved
+ * directory is evaluated against the Current state at call time.
+ */
+void test37() {
+    cout << "Running test 37...";
+
+    {
+        int err = 0;
+        zip* zh = zip_open("test.zip", ZIP_CREATE|ZIP_TRUNCATE, &err);
+        assert(zh != nullptr);
+        addRawEntry(zh, "a/", "");
+        addRawEntry(zh, "a/f.txt", "F");
+        addRawEntry(zh, "a/keep.txt", "KEEP");
+        addRawEntry(zh, "a-sibling/x.txt", "SIBLING");
+        addRawEntry(zh, "plain.txt", "PLAIN");
+        assert(zip_close(zh) == 0);
+    }
+
+    ZipArchive z("test.zip");
+    z.open(ZipArchive::Write);
+
+    //objects saved before any rename (including a copy that is used later)
+    ZipEntry dir = z.getEntry("a/");
+    ZipEntry file = z.getEntry("a/f.txt");
+    ZipEntry dirCopy = dir;
+    ZipEntry plain = z.getEntry("plain.txt");
+    assert(!dir.isNull() && dir.isDirectory());
+    assert(!file.isNull() && file.isFile());
+
+    //move a/ to b/ through the saved directory object
+    assert(z.renameEntry(dir, "b/") == 3);
+    assert(z.hasEntry("b/") && z.hasEntry("b/f.txt") && z.hasEntry("b/keep.txt"));
+    assert(!z.hasEntry("a/"));
+    //the saved file object already follows the move when reading
+    assert(file.readAsText() == "F");
+    //a merely similar neighbour never followed
+    assert(z.hasEntry("a-sibling/x.txt"));
+
+    //a brand new a/ (with a new file reusing the saved object's old name) is unrelated
+    assert(z.addData("a/f.txt", "NEWA", 4));
+    assert(z.addData("a/h.txt", "H", 1));
+    assert(z.getEntry("a/f.txt").readAsText() == "NEWA");
+
+    //renaming the saved directory moves b/'s current contents; the new a/ stays put
+    assert(z.renameEntry(dir, "c/") == 3);
+    assert(z.hasEntry("c/") && z.hasEntry("c/f.txt") && z.hasEntry("c/keep.txt"));
+    assert(!z.hasEntry("b/"));
+    assert(z.hasEntry("a/") && z.hasEntry("a/f.txt") && z.hasEntry("a/h.txt"));
+    assert(z.getEntry("a/f.txt").readAsText() == "NEWA");
+    //the saved file object designates c/f.txt
+    assert(file.readAsText() == "F");
+
+    //it can be renamed on its own; renaming to its current name is invalid
+    assert(z.renameEntry(file, "c/f2.txt") == 1);
+    assert(z.renameEntry(file, "c/f2.txt") == LIBZIPPP_ERROR_INVALID_PARAMETER);
+    assert(z.hasEntry("c/f2.txt") && !z.hasEntry("c/f.txt"));
+    //a copy of the object designates the very same entry
+    assert(z.renameEntry(file, "c/f.txt") == 1);
+
+    //the by-name overload still resolves the CURRENT name (the new a/f.txt here)
+    assert(z.renameEntry("a/f.txt", "a/f3.txt") == 1);
+    assert(z.hasEntry("a/f3.txt") && !z.hasEntry("a/f.txt"));
+
+    //destination conflict: atomic failure, object stays usable
+    istringstream streamed("STREAMED");
+    assert(z.addData("stream.txt", streamed));
+    assert(z.renameEntry(dir, "a/") == LIBZIPPP_ERROR_UNKNOWN);
+    //pre-call state restored: c/ still there, new a/ untouched, no merge
+    assert(z.hasEntry("c/") && z.hasEntry("c/f.txt") && z.hasEntry("c/keep.txt"));
+    assert(z.hasEntry("a/") && z.hasEntry("a/f3.txt") && z.hasEntry("a/h.txt"));
+    //other pending modifications are preserved
+    assert(z.getEntry("stream.txt").readAsText() == "STREAMED");
+    //the saved object remains usable for a legal operation
+    assert(z.renameEntry(dir, "d/") == 3);
+    assert(z.hasEntry("d/") && z.hasEntry("d/f.txt") && z.hasEntry("d/keep.txt"));
+    assert(!z.hasEntry("c/"));
+    //a child joined after the move follows the saved directory; one moved out does not
+    assert(z.addData("d/late.txt", "L", 1));
+    assert(z.renameEntry("d/keep.txt", "kept-out.txt") == 1);
+
+    //the directory copy saved before all the renames designates the same directory
+    assert(z.renameEntry(dirCopy, "e/") == 3); //d/, d/f.txt, d/late.txt (keep.txt moved out)
+    assert(z.hasEntry("e/") && z.hasEntry("e/f.txt") && z.hasEntry("e/late.txt"));
+    assert(!z.hasEntry("e/keep.txt"));
+    assert(z.hasEntry("kept-out.txt"));
+
+    //delete the saved file object: only e/f.txt goes; the object is then invalid
+    assert(z.deleteEntry(file) == 1);
+    assert(!z.hasEntry("e/f.txt"));
+    assert(z.deleteEntry(file) == LIBZIPPP_ERROR_INVALID_ENTRY);
+    assert(z.renameEntry(file, "x.txt") == LIBZIPPP_ERROR_INVALID_ENTRY);
+
+    //delete the saved directory object: only its current directory and children
+    assert(z.deleteEntry(dir) == 2); //e/ and e/late.txt
+    assert(!z.hasEntry("e/") && !z.hasEntry("e/late.txt"));
+    assert(z.deleteEntry(dir) == LIBZIPPP_ERROR_INVALID_ENTRY);
+    assert(z.renameEntry(dir, "z/") == LIBZIPPP_ERROR_INVALID_ENTRY);
+    //reusing the deleted directory's old name must not "revive" the object
+    assert(z.addData("e/new.txt", "EN", 2));
+    assert(z.deleteEntry(dir) == LIBZIPPP_ERROR_INVALID_ENTRY);
+    assert(z.hasEntry("e/new.txt"));
+
+    //same rule for a regular file whose old name is reused
+    assert(z.renameEntry(plain, "plain1.txt") == 1);
+    assert(z.addData("plain.txt", "NEWPLAIN", 8));
+    assert(z.deleteEntry(plain) == 1); //deletes plain1.txt, never the new plain.txt
+    assert(!z.hasEntry("plain1.txt"));
+    assert(z.getEntry("plain.txt").readAsText() == "NEWPLAIN");
+
+    assert(z.close() == LIBZIPPP_OK);
+
+    //final state after a close/reopen
+    ZipArchive r("test.zip");
+    r.open(ZipArchive::ReadOnly);
+    assert(r.hasEntry("a/") && r.hasEntry("a/f3.txt") && r.hasEntry("a/h.txt"));
+    assert(r.getEntry("a/f3.txt").readAsText() == "NEWA");
+    assert(r.hasEntry("e/new.txt") && r.getEntry("e/new.txt").readAsText() == "EN");
+    assert(r.hasEntry("plain.txt") && r.getEntry("plain.txt").readAsText() == "NEWPLAIN");
+    assert(r.hasEntry("kept-out.txt") && r.getEntry("kept-out.txt").readAsText() == "KEEP");
+    assert(r.hasEntry("stream.txt") && r.getEntry("stream.txt").readAsText() == "STREAMED");
+    assert(r.hasEntry("a-sibling/x.txt"));
+    assert(!r.hasEntry("b/") && !r.hasEntry("c/") && !r.hasEntry("d/") && !r.hasEntry("e/late.txt"));
+    r.close();
+    r.unlink();
+
+    cout << " done." << endl;
+}
+
+/*
+ * Moving a saved directory below its own path and then deleting it through the saved
+ * object: the auto-recreated same-named parent directory (and entries later placed in it)
+ * is a different entry and must survive; only the moved directory and its current
+ * descendants are removed.
+ */
+void test38() {
+    cout << "Running test 38...";
+
+    {
+        int err = 0;
+        zip* zh = zip_open("test.zip", ZIP_CREATE|ZIP_TRUNCATE, &err);
+        assert(zh != nullptr);
+        addRawEntry(zh, "a/", "");
+        addRawEntry(zh, "a/f.txt", "F");
+        assert(zip_close(zh) == 0);
+    }
+
+    ZipArchive z("test.zip");
+    z.open(ZipArchive::Write);
+    ZipEntry dir = z.getEntry("a/");
+    assert(z.renameEntry(dir, "a/b/") == 2);
+    assert(z.hasEntry("a/") && z.hasEntry("a/b/") && z.hasEntry("a/b/f.txt"));
+
+    //a file placed in the auto-recreated a/ is not part of the moved directory
+    assert(z.addData("a/late.txt", "LATE", 4));
+    //a file added under the moved directory after the move IS part of it
+    assert(z.addData("a/b/inside.txt", "IN", 2));
+
+    assert(z.deleteEntry(dir) == 3); //a/b/, a/b/f.txt, a/b/inside.txt
+    assert(!z.hasEntry("a/b/") && !z.hasEntry("a/b/f.txt") && !z.hasEntry("a/b/inside.txt"));
+    assert(z.hasEntry("a/") && z.hasEntry("a/late.txt"));
+    assert(z.deleteEntry(dir) == LIBZIPPP_ERROR_INVALID_ENTRY);
+    assert(z.close() == LIBZIPPP_OK);
+
+    ZipArchive r("test.zip");
+    r.open(ZipArchive::ReadOnly);
+    assert(r.hasEntry("a/") && r.hasEntry("a/late.txt"));
+    assert(!r.hasEntry("a/b/"));
+    r.close();
+    r.unlink();
+
+    cout << " done." << endl;
+}
+
 int main() {
     test1();  test2();  test3();  test4();  test5();
     test6();  test7();  test8();  test9();  test10();
@@ -2099,7 +2281,7 @@ int main() {
     test21(); test22(); test23(); test23_2(); test24();
     test25(); test26(); test27(); test28(); test29();
     test30(); test31(); test32(); test33(); test34();
-    test35(); test36();
+    test35(); test36(); test37(); test38();
     return 0;
 }
 
