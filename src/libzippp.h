@@ -39,6 +39,7 @@
 #include <cstdint>
 #endif
 #include <cstdio>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -418,8 +419,11 @@ namespace libzippp {
         bool setEntryComment(const ZipEntry& entry, const std::string& comment) const;
         
         /**
-         * Defines the compression method of an entry. If the ZipArchive is not open
-         * or the entry is not linked to this archive, false will be returned.
+         * Defines the compression method and level of an entry. If the ZipArchive is not
+         * open or the entry is not linked to this archive, false will be returned.
+         * A zero level uses the default behaviour of libzip; a non-zero level must be
+         * acceptable for the method (1 to 9 for DEFLATE) otherwise false is returned and
+         * neither the entry nor the archive is modified.
          **/
         bool setEntryCompressionConfig(ZipEntry& entry, CompressionMethod compMethod=CompressionMethod::DEFAULT, libzippp_uint32 compLevel=0) const;
         
@@ -655,6 +659,8 @@ namespace libzippp {
         inline libzippp_uint32 getCompressionLevel(void) const { return compressionLevel; }
 
     private:
+        friend class ZipEntry;
+
         std::string path;
         zip* zipHandle;
         zip_source* zipSource;
@@ -670,6 +676,19 @@ namespace libzippp {
         bool useArchiveCompressionMethod;
         libzippp_uint16 compressionMethod;
         libzippp_uint32 compressionLevel;
+
+        /*
+         * Compression configuration explicitly staged on individual entries during the
+         * current opening, either through the entry compression setters or through the
+         * archive defaults applied by addFile/addData. These maps are the source of truth
+         * for such entries because libzip cannot report the compression level of an entry
+         * back (a level is not stored in the archive) and reports ZIP_CM_DEFAULT as STORE
+         * in the current state. They are keyed by the (stable) libzip index of the entry,
+         * so they survive a rename, and they are cleared whenever a new opening begins:
+         * a level recorded during a previous opening is never carried over.
+         */
+        mutable std::map<libzippp_uint64, libzippp_uint16> entryCompressionMethods;
+        mutable std::map<libzippp_uint64, libzippp_uint32> entryCompressionLevels;
 
         // User-defined error handler
         ErrorHandlerCallback* errorHandlingCallback;
@@ -697,6 +716,19 @@ namespace libzippp {
          */
         bool isArchiveCompressionApplicable(void) const;
         bool isArchiveEncryptionApplicable(void) const;
+
+        /*
+         * Entry-wise compression setters behind ZipEntry::setCompressionMethod and
+         * ZipEntry::setCompressionLevel. Each one changes a single setting and re-applies
+         * the other setting currently in effect for the entry, so that two copies of the
+         * same entry can be modified alternately without the possibly outdated value
+         * captured by one copy overwriting the setting staged through the other one.
+         */
+        bool setEntryCompressionMethod(ZipEntry& entry, CompressionMethod compMethod) const;
+        bool setEntryCompressionLevel(ZipEntry& entry, libzippp_uint32 compLevel) const;
+
+        //forgets the compression configuration staged on the (deleted) entry
+        void forgetEntryCompressionConfig(libzippp_uint64 index) const;
 
         /*
          * Shared staging used by addFile and addData. createParentDirectories creates
@@ -730,8 +762,9 @@ namespace libzippp {
         bool openBuffer(void** buffer, libzippp_uint32 sz, OpenMode mode=ReadOnly, bool checkConsistency=false);
         bool openSource(zip_source* source, OpenMode mode=ReadOnly, bool checkConsistency=false);
         
-        //generic method to create ZipEntry
-        ZipEntry createEntry(struct zip_stat* stat) const;
+        //generic method to create ZipEntry, reflecting the compression configuration
+        //of the entry in the given state (never the archive default compression)
+        ZipEntry createEntry(struct zip_stat* stat, State state) const;
 
         //converts the logical state into the flags used by libzip
         static int stateFlags(State state);
