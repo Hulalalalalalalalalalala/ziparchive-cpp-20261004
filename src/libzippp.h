@@ -527,19 +527,44 @@ namespace libzippp {
         
         /**
          * Adds the specified file in the archive with the given entry. If the entry already exists,
-         * it will be replaced. This method returns true if the file has been added successfully. 
+         * it will be replaced. This method returns true if the file has been added successfully.
          * If the entryName contains folders that don't exist in the archive, they will be automatically created.
          * If the entryName denotes a directory, this method returns false.
          * The zip file must be open otherwise false will be returned.
+         *
+         * The addition is atomic: the content, the automatically created parent directories and
+         * the compression/encryption settings selected on the archive are either all accepted
+         * (true is returned) or the archive is left exactly as it was before the call (false is
+         * returned). In particular, false is returned - without leaving a new entry, empty parent
+         * directories behind, nor silently falling back to default compression or no encryption -
+         * when the source file does not exist or when the underlying libzip cannot apply the
+         * selected compression or encryption method. A true return value only means the change
+         * is staged: it is written back to the archive by close(). After a failed call, the
+         * archive stays open, every pending change (including previous replacements of the same
+         * entry) is preserved and the call can be retried with different settings.
          */
         bool addFile(const std::string& entryName, const std::string& file) const;
-        
+
         /**
          * Adds the given data to the specified entry name in the archive. If the entry already exists,
-         * its content will be erased. 
+         * its content will be erased.
          * If the entryName contains folders that don't exist in the archive, they will be automatically created.
          * If the entryName denotes a directory, this method returns false.
          * If the zip file is not open, this method returns false.
+         *
+         * A null data pointer is only accepted with a zero length (it writes an empty file);
+         * a null data pointer with a non-zero length returns false.
+         *
+         * The addition is atomic, exactly like addFile: on failure the archive is left exactly
+         * as it was before the call (no new entry, no empty parent directory, no fallback to
+         * default compression or no encryption) and stays open and usable.
+         *
+         * When freeData is false, the caller keeps the ownership of the data, which must remain
+         * valid until the changes are committed (close) or abandoned (discard). When freeData is
+         * true, the data must be freeable with free(): the ownership is transferred to the archive
+         * only if true is returned (it is then released exactly once, when the changes are
+         * committed or discarded); if false is returned, the caller keeps the ownership and may
+         * free the data immediately.
          */
         bool addData(const std::string& entryName, const void* data, libzippp_uint64 length, bool freeData=false) const;
         
@@ -651,6 +676,41 @@ namespace libzippp {
 
         //open-session marker shared with every ZipEntry created by this opening
         std::shared_ptr<ZipEntrySession> entrySession;
+
+        /*
+         * Buffers adopted through addData(..., freeData=true). The data is always handed
+         * to libzip with freep=0 so that a failed addition never releases the caller's
+         * memory; once the addition has fully succeeded, the archive owns the buffer and
+         * releases it exactly once, when the pending changes are committed (close) or
+         * abandoned (discard).
+         */
+        mutable std::vector<void*> adoptedBuffers;
+
+        //releases the adopted buffers (see adoptedBuffers)
+        void releaseAdoptedBuffers(void);
+
+        /*
+         * Returns true if the compression/encryption method selected on the archive can
+         * be applied by the underlying libzip. These checks are performed before any
+         * modification so that an unsupported method fails without leaving any trace
+         * (instead of silently falling back to default compression or no encryption).
+         */
+        bool isArchiveCompressionApplicable(void) const;
+        bool isArchiveEncryptionApplicable(void) const;
+
+        /*
+         * Shared staging used by addFile and addData. createParentDirectories creates
+         * the missing parent directories of entryName and records the indices of the
+         * directories it created; on failure it removes them itself and returns false.
+         * rollbackCreatedDirectories removes exactly those directories (pre-existing
+         * ones are never touched). installPreparedSource attaches the source to the
+         * entry (overwriting any existing one) and applies the archive compression and
+         * encryption settings; on failure the source is released (without freeing its
+         * data), every change done by the call is reverted and false is returned.
+         */
+        bool createParentDirectories(const std::string& entryName, std::vector<libzippp_uint64>& createdDirIndices) const;
+        void rollbackCreatedDirectories(const std::vector<libzippp_uint64>& createdDirIndices) const;
+        bool installPreparedSource(const std::string& entryName, zip_source* source, const std::vector<libzippp_uint64>& createdDirIndices) const;
 
         //creates/destroys the open-session marker shared with the entries
         void beginEntrySession(void);

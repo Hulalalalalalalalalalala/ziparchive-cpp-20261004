@@ -1324,6 +1324,303 @@ void test29() {
     cout << " done." << endl;
 }
 
+/*
+ * Failed additions must not leave any trace: when the source file does not exist,
+ * addFile returns false and neither the entry nor its (missing) parent directories
+ * are created. The archive stays open and usable: other pending changes are preserved
+ * and a subsequent valid addition can still be committed with the same close().
+ * The historical rejections (not open, read-only, directory name) are unchanged.
+ */
+void test30() {
+    cout << "Running test 30...";
+
+    ZipArchive z0("test.zip");
+    z0.open(ZipArchive::Write);
+    assert(z0.addData("keep/me.txt", "KEEP", 4));
+    assert(z0.close() == LIBZIPPP_OK);
+
+    //not open / read-only / directory name: still rejected
+    ZipArchive zc("test.zip");
+    assert(!zc.addData("x.txt", "y", 1));
+    assert(!zc.addFile("x.txt", "tests.cpp"));
+    ZipArchive zr("test.zip");
+    zr.open(ZipArchive::ReadOnly);
+    assert(!zr.addData("x.txt", "y", 1));
+    assert(!zr.addFile("x.txt", "tests.cpp"));
+    assert(zr.close() == LIBZIPPP_OK);
+
+    ZipArchive z1("test.zip");
+    z1.open(ZipArchive::Write);
+    assert(!z1.addData("dir/", "y", 1)); //a directory name is not a file
+    assert(!z1.addFile("dir/", "tests.cpp"));
+
+    //missing source file: false, and no trace left behind
+    assert(!z1.addFile("newdir/sub/missing.txt", "this-file-does-not-exist.bin"));
+    assert(!z1.hasEntry("newdir/sub/missing.txt"));
+    assert(!z1.hasEntry("newdir/"));
+    assert(!z1.hasEntry("newdir/sub/"));
+    assert(z1.getNbEntries(ZipArchive::Current)==2); //keep/ and keep/me.txt only
+
+    //the archive is still open and usable: the same entry can be written validly
+    assert(z1.isOpen());
+    assert(z1.addData("newdir/sub/missing.txt", "NOW", 3));
+    assert(z1.getEntry("newdir/sub/missing.txt").readAsText() == "NOW");
+    assert(z1.close() == LIBZIPPP_OK);
+
+    ZipArchive z2("test.zip");
+    z2.open(ZipArchive::ReadOnly);
+    assert(z2.getEntry("keep/me.txt").readAsText() == "KEEP");
+    assert(z2.getEntry("newdir/sub/missing.txt").readAsText() == "NOW");
+    z2.close();
+    z2.unlink();
+
+    cout << " done." << endl;
+}
+
+/*
+ * addData input validation: a null data pointer with a non-zero length is rejected
+ * before the archive is touched (no entry, no parent directory), while a null data
+ * pointer with a zero length still writes an empty file.
+ */
+void test31() {
+    cout << "Running test 31...";
+
+    ZipArchive z1("test.zip");
+    z1.open(ZipArchive::Write);
+    assert(!z1.addData("dir/rejected.txt", nullptr, 10));
+    assert(!z1.hasEntry("dir/rejected.txt"));
+    assert(!z1.hasEntry("dir/"));
+    assert(z1.getNbEntries(ZipArchive::Current)==0);
+    assert(z1.addData("dir/empty.txt", nullptr, 0));
+    assert(z1.close() == LIBZIPPP_OK);
+
+    ZipArchive z2("test.zip");
+    z2.open(ZipArchive::ReadOnly);
+    assert(!z2.hasEntry("dir/rejected.txt"));
+    assert(z2.hasEntry("dir/"));
+    assert(z2.hasEntry("dir/empty.txt"));
+    ZipEntry empty = z2.getEntry("dir/empty.txt");
+    assert(!empty.isNull());
+    assert(empty.getSize()==0);
+    assert(empty.readAsText().empty());
+    z2.close();
+    z2.unlink();
+
+    cout << " done." << endl;
+}
+
+/*
+ * A failed overwrite must preserve the exact pre-call state: a previous (uncommitted)
+ * replacement of the same entry, its comment, its compression settings, the other
+ * pending additions/deletions/renames and the archive comment all survive. Existing
+ * parent directories are never removed. The archive stays open, previously obtained
+ * ZipEntry objects remain usable and a valid overwrite can still be committed.
+ */
+void test32() {
+    cout << "Running test 32...";
+
+    ZipArchive z0("test.zip");
+    z0.open(ZipArchive::Write);
+    z0.addData("dir/file.txt", "ORIGINAL", 8);
+    z0.addData("dir/comp.txt", "COMP", 4);
+    z0.addData("dir/other.txt", "OTHER", 5);
+    z0.addData("victim.txt", "V", 1);
+    assert(z0.close() == LIBZIPPP_OK);
+
+    ZipArchive z1("test.zip");
+    z1.open(ZipArchive::Write);
+
+    //pending changes staged before the failing call
+    assert(z1.addData("dir/file.txt", "REPLACED", 8)); //uncommitted overwrite
+    ZipEntry f = z1.getEntry("dir/file.txt");
+    assert(!f.isNull());
+    assert(f.setComment("my-comment"));
+    ZipEntry fc = z1.getEntry("dir/comp.txt");
+    assert(!fc.isNull());
+    assert(fc.setCompressionMethod(DEFLATE)); //staged compression change on another entry
+    assert(z1.addData("added.txt", "A", 1));
+    assert(z1.deleteEntry("victim.txt")==1);
+    assert(z1.renameEntry("dir/other.txt", "dir/moved.txt")==1);
+    assert(z1.setComment("archive-comment"));
+
+    //the failing overwrite (missing source file) must not change anything
+    assert(!z1.addFile("dir/file.txt", "no-such-source-file.bin"));
+    assert(z1.isOpen());
+
+    //the previously obtained entry is still usable and shows the staged changes
+    assert(f.readAsText() == "REPLACED");
+    assert(f.getComment() == "my-comment");
+    ZipEntry f2 = z1.getEntry("dir/file.txt");
+    assert(f2.readAsText() == "REPLACED");
+    assert(f2.getComment() == "my-comment");
+    //the staged compression change is untouched by the failed call
+    assert(z1.getEntry("dir/comp.txt").getCompressionMethod()==DEFLATE);
+    //all the other pending changes are preserved
+    assert(z1.hasEntry("added.txt"));
+    assert(!z1.hasEntry("victim.txt"));
+    assert(z1.hasEntry("dir/moved.txt"));
+    assert(!z1.hasEntry("dir/other.txt"));
+    assert(z1.getComment() == "archive-comment");
+    assert(z1.hasEntry("dir/")); //existing parent directory untouched
+
+    //a valid overwrite is still possible and commits with everything else
+    assert(z1.addData("dir/file.txt", "FINAL", 5));
+    assert(z1.close() == LIBZIPPP_OK);
+
+    ZipArchive z2("test.zip");
+    z2.open(ZipArchive::ReadOnly);
+    ZipEntry r = z2.getEntry("dir/file.txt");
+    assert(r.readAsText() == "FINAL");
+    assert(r.getComment() == "my-comment");
+    ZipEntry rc = z2.getEntry("dir/comp.txt");
+    assert(rc.getCompressionMethod()==DEFLATE);
+    assert(rc.readAsText() == "COMP");
+    assert(z2.hasEntry("added.txt"));
+    assert(!z2.hasEntry("victim.txt"));
+    assert(z2.getEntry("dir/moved.txt").readAsText() == "OTHER");
+    assert(z2.getComment() == "archive-comment");
+    z2.close();
+    z2.unlink();
+
+    cout << " done." << endl;
+}
+
+/*
+ * Ownership of the data buffer with freeData=true: the memory must be freeable with
+ * free(). On success the archive owns it and releases it exactly once, whether the
+ * changes are committed, overwritten again or discarded; on failure the caller keeps
+ * the ownership and may free it immediately. freeData=false leaves the ownership to
+ * the caller in every case. Run under valgrind/ASAN (see the Makefile tests targets):
+ * a regression surfaces as a double-free, invalid free or leak here.
+ */
+void test33() {
+    cout << "Running test 33...";
+
+    //success + successive overwrite + commit: each buffer is freed exactly once
+    {
+        ZipArchive z("test.zip");
+        z.open(ZipArchive::Write);
+        char* data1 = (char*)malloc(6);
+        memcpy(data1, "HELLO", 6);
+        assert(z.addData("a/b.txt", data1, 5, true));
+        char* data2 = (char*)malloc(6);
+        memcpy(data2, "WORLD", 6);
+        assert(z.addData("a/b.txt", data2, 5, true)); //replaces the previous buffer
+        assert(z.close() == LIBZIPPP_OK);
+
+        ZipArchive r("test.zip");
+        r.open(ZipArchive::ReadOnly);
+        assert(r.getEntry("a/b.txt").readAsText() == "WORLD");
+        r.close();
+        r.unlink();
+    }
+
+    //discard: the adopted buffer is released without being committed
+    {
+        ZipArchive z("test.zip");
+        z.open(ZipArchive::Write);
+        char* data = (char*)malloc(4);
+        memcpy(data, "DIS", 4);
+        assert(z.addData("gone.txt", data, 3, true));
+        z.discard();
+        assert(!z.isOpen());
+    }
+
+    //failure: the caller keeps the ownership and frees the buffer itself
+    {
+        ZipArchive z("test.zip");
+        z.open(ZipArchive::Write);
+        char* rejected = (char*)malloc(8);
+        memcpy(rejected, "MINE", 4);
+        assert(!z.addData("bad.txt", nullptr, 10, true)); //rejected before any adoption
+        free(rejected); //must not have been freed by the archive
+        //freeData=false: the caller owns the memory until the commit
+        char* kept = (char*)malloc(5);
+        memcpy(kept, "KEPT", 5);
+        assert(z.addData("kept.txt", kept, 4, false));
+        assert(z.close() == LIBZIPPP_OK);
+        free(kept); //valid until here: the commit is done
+
+        ZipArchive r("test.zip");
+        r.open(ZipArchive::ReadOnly);
+        assert(r.getEntry("kept.txt").readAsText() == "KEPT");
+        assert(!r.hasEntry("bad.txt"));
+        r.close();
+        r.unlink();
+    }
+
+    cout << " done." << endl;
+}
+
+/*
+ * The compression and encryption methods selected on the archive are applied to the
+ * added entries: after a commit, reopening the archive shows the same methods and the
+ * same content. (The encryption part requires libzippp to be built with
+ * LIBZIPPP_WITH_ENCRYPTION.)
+ */
+void test34() {
+    cout << "Running test 34...";
+
+    ZipArchive z1("test.zip");
+    z1.setCompressionMethod(DEFLATE);
+    z1.open(ZipArchive::Write);
+    assert(z1.addData("c/file.txt", "DATA", 4));
+    assert(z1.close() == LIBZIPPP_OK);
+
+    ZipArchive z2("test.zip");
+    z2.open(ZipArchive::ReadOnly);
+    ZipEntry c = z2.getEntry("c/file.txt");
+    assert(!c.isNull());
+    assert(c.getCompressionMethod()==DEFLATE);
+    assert(c.readAsText() == "DATA");
+    z2.close();
+    z2.unlink();
+
+#ifdef LIBZIPPP_WITH_ENCRYPTION
+    ZipArchive z3("test.zip", "password", ZipArchive::Aes256);
+    z3.open(ZipArchive::Write);
+    assert(z3.addData("secret/data.txt", "TOPSECRET", 9));
+    assert(z3.close() == LIBZIPPP_OK);
+
+    ZipArchive z4("test.zip", "password", ZipArchive::Aes256);
+    z4.open(ZipArchive::ReadOnly);
+    ZipEntry s = z4.getEntry("secret/data.txt");
+    assert(!s.isNull());
+    assert(s.getEncryptionMethod()==ZIP_EM_AES_256);
+    assert(s.readAsText() == "TOPSECRET");
+    z4.close();
+    z4.unlink();
+
+    //a failed overwrite on an encrypted archive preserves the staged encrypted
+    //replacement, its comment and its encryption settings
+    ZipArchive z5("test.zip", "password", ZipArchive::Aes256);
+    z5.open(ZipArchive::Write);
+    assert(z5.addData("s.txt", "ONE", 3));
+    assert(z5.close() == LIBZIPPP_OK);
+
+    ZipArchive z6("test.zip", "password", ZipArchive::Aes256);
+    z6.open(ZipArchive::Write);
+    assert(z6.addData("s.txt", "TWO", 3)); //staged encrypted replacement
+    ZipEntry se = z6.getEntry("s.txt");
+    assert(se.setComment("secret-comment"));
+    assert(!z6.addFile("s.txt", "no-such-file.bin")); //failed overwrite
+    assert(se.readAsText() == "TWO");
+    assert(se.getComment() == "secret-comment");
+    assert(z6.close() == LIBZIPPP_OK);
+
+    ZipArchive z7("test.zip", "password", ZipArchive::Aes256);
+    z7.open(ZipArchive::ReadOnly);
+    ZipEntry se2 = z7.getEntry("s.txt");
+    assert(se2.readAsText() == "TWO");
+    assert(se2.getComment() == "secret-comment");
+    assert(se2.getEncryptionMethod()==ZIP_EM_AES_256);
+    z7.close();
+    z7.unlink();
+#endif
+
+    cout << " done." << endl;
+}
+
 int main() {
     test1();  test2();  test3();  test4();  test5();
     test6();  test7();  test8();  test9();  test10();
@@ -1331,6 +1628,7 @@ int main() {
     test16(); test17(); test18(); test19(); test20();
     test21(); test22(); test23(); test23_2(); test24();
     test25(); test26(); test27(); test28(); test29();
+    test30(); test31(); test32(); test33(); test34();
     return 0;
 }
 
