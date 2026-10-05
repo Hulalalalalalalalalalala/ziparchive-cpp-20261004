@@ -39,6 +39,7 @@
 #include <cstdint>
 #endif
 #include <cstdio>
+#include <iosfwd>
 #include <map>
 #include <memory>
 #include <string>
@@ -580,7 +581,45 @@ namespace libzippp {
          * If the zip file is not open, this method returns false.
          */
         bool addData(const std::string& entryName, const std::basic_string<libzippp_uint8> data) const;
-        
+
+        /**
+         * Adds the content read from the given input stream to the specified entry name
+         * in the archive. If the entry already exists, its content will be erased.
+         * If the entryName contains folders that don't exist in the archive, they will
+         * be automatically created. If the entryName is empty or denotes a directory,
+         * this method returns false. If the zip file is not open or is read-only, this
+         * method returns false.
+         *
+         * The stream is read from its current position to its normal end, in binary:
+         * every byte (including zero bytes) is part of the content and an empty stream
+         * writes an empty file. The length does not need to be known in advance and the
+         * stream does not need to be seekable. The content is spooled through a
+         * fixed-size chunk buffer, so the memory used by this method does not grow with
+         * the size of the content. The whole content is received before true is
+         * returned: the caller may then close or destroy the stream, the staged entry
+         * (readable in the Current state with its exact size) and the commit no longer
+         * depend on it. The stream is never closed by this method, its exception mask
+         * is left untouched and the bytes already consumed are not pushed back.
+         *
+         * An exception raised by the stream at its normal end is still treated as a
+         * completed read. Any other read error or exception, and any failure to save
+         * the bytes already read, makes this method return false (the exception is
+         * never propagated to the caller). The addition is atomic, exactly like the
+         * other addData overloads: on failure the archive is left exactly as it was
+         * before the call (no new entry, no half-written content, no empty parent
+         * directory, no fallback to default compression or no encryption) and stays
+         * open and usable. When the archive is not open, is read-only, the entry name
+         * is invalid or the selected compression/encryption is not applicable, false
+         * is returned without consuming anything from the stream.
+         *
+         * A true return value only means the content is staged: it is written back to
+         * the archive by close() (and abandoned by discard()). The resources held for
+         * the staged content are released exactly once, when the changes are committed,
+         * discarded or the archive is destroyed, including when the same entry is
+         * overwritten several times in a row.
+         */
+        bool addData(const std::string& entryName, std::istream& input) const;
+
         /**
          * Adds the specified entry to the ZipArchive. All the needed hierarchy will be created.
          * The entryName must be a directory (end with '/').

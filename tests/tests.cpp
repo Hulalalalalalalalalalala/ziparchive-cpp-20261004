@@ -40,6 +40,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 
 #include "libzippp.h"
@@ -78,6 +80,51 @@ public:
     int cancel() {
       return 0;
     }
+};
+
+/*
+ * Serves its content once, through the get area only: seeking is not supported, so
+ * the std::istream built on it behaves like a pipe or a network stream (the length
+ * cannot be known without reading to the end).
+ */
+class NonSeekableBuf : public streambuf {
+public:
+    NonSeekableBuf(const char* data, size_t size) {
+        char* begin = const_cast<char*>(data);
+        setg(begin, begin, begin+size);
+    }
+};
+
+/*
+ * Serves failAfter bytes and then throws from underflow: the std::istream built on
+ * it turns the next read into a badbit failure (a genuine read error, not an EOF).
+ */
+class ThrowingBuf : public streambuf {
+public:
+    ThrowingBuf(const char* data, size_t size, size_t failAfter) : data(data), size(size), failAfter(failAfter), pos(0) {}
+protected:
+    int_type underflow() {
+        if (pos>=failAfter) { throw runtime_error("read error"); }
+        if (pos>=size) { return traits_type::eof(); }
+        char* at = const_cast<char*>(data)+pos;
+        setg(at, at, at+1);
+        ++pos;
+        return traits_type::to_int_type(*gptr());
+    }
+private:
+    const char* data;
+    size_t size;
+    size_t failAfter;
+    size_t pos;
+};
+
+// A progress listener whose cancellation of the commit can be switched on and off.
+class CancelListener : public ZipProgressListener {
+public:
+    CancelListener(void) : cancelCommit(false) {}
+    bool cancelCommit;
+    void progression(double) {}
+    int cancel() { return cancelCommit ? 1 : 0; }
 };
 
 void test1() {
@@ -1621,6 +1668,378 @@ void test34() {
     cout << " done." << endl;
 }
 
+/*
+ * ZipArchive::addData(entryName, std::istream&): the content is read from the current
+ * position of the stream to its normal end, in binary, without knowing the length in
+ * advance and without seeking. The whole content is staged before true is returned:
+ * the stream may be destroyed right after the call, the Current state shows the new
+ * content with its exact size and the commit no longer depends on the stream.
+ */
+void test35() {
+    cout << "Running test 35...";
+
+    //binary content (zero bytes included) from a non-seekable stream, parent
+    //directories created automatically, Current vs Original before the commit
+    {
+        string content;
+        content.push_back('A');
+        content.push_back('\0');
+        content.push_back('B');
+        content.push_back('\0');
+        content.push_back('\0');
+        content.push_back('C');
+
+        ZipArchive z("test.zip");
+        z.open(ZipArchive::Write);
+        {
+            NonSeekableBuf buf(content.data(), content.size());
+            istream in(&buf);
+            assert(z.addData("deep/dir/file.bin", in));
+            assert(in.eof()); //the stream has been fully consumed
+        }
+        //the stream is destroyed: the staged entry must still be fully usable
+        ZipEntry e = z.getEntry("deep/dir/file.bin");
+        assert(!e.isNull());
+        assert(e.getSize()==content.size());
+        basic_string<libzippp_uint8> staged = e.readAsBinaryString();
+        assert(staged.size()==content.size());
+        assert(memcmp(staged.data(), content.data(), content.size())==0);
+        assert(z.hasEntry("deep/"));
+        assert(z.hasEntry("deep/dir/"));
+        //the new entry does not exist in the Original state
+        assert(z.getEntry("deep/dir/file.bin", false, true, ZipArchive::Original).isNull());
+        assert(z.close()==LIBZIPPP_OK);
+
+        ZipArchive r("test.zip");
+        r.open(ZipArchive::ReadOnly);
+        ZipEntry re = r.getEntry("deep/dir/file.bin");
+        assert(!re.isNull());
+        assert(re.getSize()==content.size());
+        basic_string<libzippp_uint8> back = re.readAsBinaryString();
+        assert(back.size()==content.size());
+        assert(memcmp(back.data(), content.data(), content.size())==0);
+        r.close();
+        r.unlink();
+    }
+
+    //the compression method and level selected on the archive apply to stream
+    //additions exactly as to the other ones
+    {
+        ZipArchive z("test.zip");
+        z.setCompressionMethod(DEFLATE);
+        z.setCompressionLevel(9);
+        z.open(ZipArchive::Write);
+        istringstream in("COMPRESS-ME-COMPRESS-ME-COMPRESS-ME");
+        assert(z.addData("compressed.txt", in));
+        ZipEntry e = z.getEntry("compressed.txt");
+        assert(!e.isNull());
+        assert(e.getCompressionMethod()==DEFLATE);
+        assert(e.getCompressionLevel()==9);
+        assert(z.close()==LIBZIPPP_OK);
+
+        ZipArchive r("test.zip");
+        r.open(ZipArchive::ReadOnly);
+        ZipEntry re = r.getEntry("compressed.txt");
+        assert(!re.isNull());
+        assert(re.getCompressionMethod()==DEFLATE);
+        assert(re.readAsText()=="COMPRESS-ME-COMPRESS-ME-COMPRESS-ME");
+        r.close();
+        r.unlink();
+    }
+
+    //an empty stream writes an empty file
+    {
+        ZipArchive z("test.zip");
+        z.open(ZipArchive::Write);
+        istringstream empty("");
+        assert(z.addData("empty.txt", empty));
+        ZipEntry e = z.getEntry("empty.txt");
+        assert(!e.isNull());
+        assert(e.getSize()==0);
+        assert(z.close()==LIBZIPPP_OK);
+
+        ZipArchive r("test.zip");
+        r.open(ZipArchive::ReadOnly);
+        ZipEntry re = r.getEntry("empty.txt");
+        assert(!re.isNull());
+        assert(re.getSize()==0);
+        assert(re.readAsText().empty());
+        r.close();
+        r.unlink();
+    }
+
+    //successive overwrites of the same entry and a content larger than the chunk
+    //size (run under valgrind/ASAN: no leak, no double free of the spooled content)
+    {
+        string big(4*1024*1023+7, '\0'); //~4MB, not a multiple of the chunk size
+        for (size_t i=0 ; i<big.size() ; ++i) { big[i] = (char)((i*31 + i/7) & 0xFF); }
+
+        ZipArchive z("test.zip");
+        z.open(ZipArchive::Write);
+        {
+            istringstream first("FIRST");
+            assert(z.addData("big.bin", first));
+        }
+        {
+            NonSeekableBuf buf(big.data(), big.size());
+            istream in(&buf);
+            assert(z.addData("big.bin", in)); //replaces the staged content
+        }
+        ZipEntry e = z.getEntry("big.bin");
+        assert(e.getSize()==big.size());
+        assert(z.close()==LIBZIPPP_OK);
+
+        ZipArchive r("test.zip");
+        r.open(ZipArchive::ReadOnly);
+        ZipEntry re = r.getEntry("big.bin");
+        assert(re.getSize()==big.size());
+        basic_string<libzippp_uint8> back = re.readAsBinaryString();
+        assert(back.size()==big.size());
+        assert(memcmp(back.data(), big.data(), big.size())==0);
+        r.close();
+        r.unlink();
+    }
+
+    cout << " done." << endl;
+}
+
+/*
+ * Stream additions are rejected without consuming anything from the stream when the
+ * archive is not open, is read-only, the entry name is invalid or the selected
+ * compression is not applicable. A read error or a non-EOF stream exception makes
+ * the call fail (nothing is propagated to the caller) and leaves the archive exactly
+ * as it was: previous staged changes, comments and other pending modifications are
+ * preserved, no half-written content and no new parent directory is left behind.
+ */
+void test36() {
+    cout << "Running test 36...";
+
+    //rejections that must not consume anything from the stream
+    {
+        ZipArchive z("test.zip");
+        istringstream in("DATA");
+        assert(!z.addData("file.txt", in)); //not open
+        assert(in.tellg()==0);
+
+        z.open(ZipArchive::Write);
+        assert(z.addData("committed.txt", "X", 1));
+        assert(z.close()==LIBZIPPP_OK);
+
+        ZipArchive ro("test.zip");
+        ro.open(ZipArchive::ReadOnly);
+        istringstream in2("DATA");
+        assert(!ro.addData("file.txt", in2)); //read-only
+        assert(in2.tellg()==0);
+        ro.close();
+
+        ZipArchive w("test.zip");
+        w.open(ZipArchive::Write);
+        istringstream in3("DATA");
+        assert(!w.addData("", in3)); //empty name
+        assert(in3.tellg()==0);
+        istringstream in4("DATA");
+        assert(!w.addData("dir/", in4)); //a directory
+        assert(in4.tellg()==0);
+        assert(!w.hasEntry("dir/"));
+        w.discard();
+        w.unlink();
+    }
+
+    //an inapplicable compression setting is rejected before any byte is consumed
+    {
+        ZipArchive z("test.zip");
+        z.setCompressionMethod(DEFLATE);
+        z.setCompressionLevel(10); //out of the documented 1-9 DEFLATE range
+        z.open(ZipArchive::Write);
+        istringstream in("DATA");
+        assert(!z.addData("file.txt", in));
+        assert(in.tellg()==0);
+        assert(!z.hasEntry("file.txt"));
+        z.discard();
+        z.unlink();
+    }
+
+    //a read error in the middle of the content leaves the archive exactly as it was
+    {
+        ZipArchive z0("test.zip");
+        z0.open(ZipArchive::Write);
+        z0.addData("dir/file.txt", "ORIGINAL", 8);
+        z0.addData("keep.txt", "K", 1);
+        assert(z0.close()==LIBZIPPP_OK);
+
+        ZipArchive z("test.zip");
+        z.open(ZipArchive::Write);
+        assert(z.addData("dir/file.txt", "STAGED", 6)); //uncommitted overwrite
+        ZipEntry f = z.getEntry("dir/file.txt");
+        assert(f.setComment("cmt"));
+        assert(z.addData("other.txt", "O", 1));
+
+        //the stream fails after 7 bytes: false, and no trace is left in the archive
+        string payload = "PARTIAL-CONTENT-THAT-FAILS";
+        ThrowingBuf buf(payload.data(), payload.size(), 7);
+        istream in(&buf);
+        assert(!z.addData("newdir/sub/fail.txt", in));
+        assert(z.isOpen());
+        assert(!z.hasEntry("newdir/sub/fail.txt"));
+        assert(!z.hasEntry("newdir/")); //no parent directory left behind
+        //everything staged before the failure is preserved
+        assert(f.readAsText()=="STAGED");
+        assert(f.getComment()=="cmt");
+        assert(z.hasEntry("other.txt"));
+        assert(z.hasEntry("keep.txt"));
+
+        //the archive is still fully usable: a valid stream write commits
+        istringstream ok("FINAL");
+        assert(z.addData("dir/file.txt", ok));
+        assert(z.close()==LIBZIPPP_OK);
+
+        ZipArchive r("test.zip");
+        r.open(ZipArchive::ReadOnly);
+        assert(r.getEntry("dir/file.txt").readAsText()=="FINAL");
+        assert(r.getEntry("dir/file.txt").getComment()=="cmt");
+        assert(r.hasEntry("other.txt"));
+        assert(r.getEntry("keep.txt").readAsText()=="K");
+        assert(!r.hasEntry("newdir/sub/fail.txt"));
+        r.close();
+        r.unlink();
+    }
+
+    //a stream throwing at its normal end (exceptions mask with eofbit/failbit) is
+    //still fully read
+    {
+        ZipArchive z("test.zip");
+        z.open(ZipArchive::Write);
+        istringstream in("EOF-THROWS");
+        in.exceptions(ios::eofbit | ios::failbit);
+        assert(z.addData("eof.txt", in));
+        assert(z.close()==LIBZIPPP_OK);
+
+        ZipArchive r("test.zip");
+        r.open(ZipArchive::ReadOnly);
+        assert(r.getEntry("eof.txt").readAsText()=="EOF-THROWS");
+        r.close();
+        r.unlink();
+    }
+
+    //a stream throwing a genuine error: false, and no exception reaches the caller
+    {
+        ZipArchive z("test.zip");
+        z.open(ZipArchive::Write);
+        string payload = "SOME-PAYLOAD";
+        ThrowingBuf buf(payload.data(), payload.size(), 4);
+        istream in(&buf);
+        in.exceptions(ios::badbit);
+        bool thrown = false;
+        bool ok = true;
+        try {
+            ok = z.addData("fail.txt", in);
+        } catch (...) {
+            thrown = true; //must never happen
+        }
+        assert(!thrown);
+        assert(!ok);
+        assert(!z.hasEntry("fail.txt"));
+        z.discard();
+        z.unlink();
+    }
+
+    cout << " done." << endl;
+}
+
+/*
+ * A true return value of the stream addition only means the content is staged: a
+ * cancelled commit keeps the archive open, the file on disk unchanged and the staged
+ * content valid, so that closing again (after the input stream is gone) commits it
+ * completely. discard() abandons the staged content. The archive encryption applies
+ * to stream additions exactly as to the other ones.
+ */
+void test37() {
+    cout << "Running test 37...";
+
+    //cancelled commit, then a successful one after the stream has been destroyed
+    {
+        ZipArchive z0("test.zip");
+        z0.open(ZipArchive::Write);
+        z0.addData("existing.txt", "OLD", 3);
+        assert(z0.close()==LIBZIPPP_OK);
+
+        ZipArchive z("test.zip");
+        z.open(ZipArchive::Write);
+        CancelListener listener;
+        z.addProgressListener(&listener);
+        string content = "STREAMED-CONTENT";
+        {
+            istringstream in(content);
+            assert(z.addData("streamed.txt", in));
+        } //the stream is destroyed here
+        listener.cancelCommit = true;
+        assert(z.close()==LIBZIPPP_ERROR_HANDLE_FAILURE);
+        assert(z.isOpen()); //the archive is still open and usable
+        //the file on disk is unchanged
+        {
+            ZipArchive disk("test.zip");
+            disk.open(ZipArchive::ReadOnly);
+            assert(!disk.hasEntry("streamed.txt"));
+            assert(disk.getEntry("existing.txt").readAsText()=="OLD");
+            disk.close();
+        }
+        //the staged content is still there
+        assert(z.getEntry("streamed.txt").readAsText()==content);
+        listener.cancelCommit = false;
+        assert(z.close()==LIBZIPPP_OK);
+
+        ZipArchive r("test.zip");
+        r.open(ZipArchive::ReadOnly);
+        assert(r.getEntry("streamed.txt").readAsText()==content);
+        assert(r.getEntry("existing.txt").readAsText()=="OLD");
+        r.close();
+        r.unlink();
+    }
+
+    //discard abandons the staged stream content
+    {
+        ZipArchive z0("test.zip");
+        z0.open(ZipArchive::Write);
+        z0.addData("existing.txt", "OLD", 3);
+        assert(z0.close()==LIBZIPPP_OK);
+
+        ZipArchive z("test.zip");
+        z.open(ZipArchive::Write);
+        istringstream in("ABANDONED");
+        assert(z.addData("streamed.txt", in));
+        z.discard();
+
+        ZipArchive r("test.zip");
+        r.open(ZipArchive::ReadOnly);
+        assert(!r.hasEntry("streamed.txt"));
+        assert(r.getEntry("existing.txt").readAsText()=="OLD");
+        r.close();
+        r.unlink();
+    }
+
+#ifdef LIBZIPPP_WITH_ENCRYPTION
+    //the archive encryption applies to stream additions exactly as to the other ones
+    {
+        ZipArchive z("test.zip", "password", ZipArchive::Aes256);
+        z.open(ZipArchive::Write);
+        istringstream in("TOPSECRET");
+        assert(z.addData("secret.txt", in));
+        assert(z.close()==LIBZIPPP_OK);
+
+        ZipArchive r("test.zip", "password", ZipArchive::Aes256);
+        r.open(ZipArchive::ReadOnly);
+        ZipEntry s = r.getEntry("secret.txt");
+        assert(!s.isNull());
+        assert(s.getEncryptionMethod()==ZIP_EM_AES_256);
+        assert(s.readAsText()=="TOPSECRET");
+        r.close();
+        r.unlink();
+    }
+#endif
+
+    cout << " done." << endl;
+}
+
 int main() {
     test1();  test2();  test3();  test4();  test5();
     test6();  test7();  test8();  test9();  test10();
@@ -1629,6 +2048,7 @@ int main() {
     test21(); test22(); test23(); test23_2(); test24();
     test25(); test26(); test27(); test28(); test29();
     test30(); test31(); test32(); test33(); test34();
+    test35(); test36(); test37();
     return 0;
 }
 

@@ -43,6 +43,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <istream>
 #include <memory>
 
 #include "libzippp.h"
@@ -69,6 +70,11 @@ using namespace std;
   #endif
   #if LIBZIP_VERSION_MAJOR>1 || (LIBZIP_VERSION_MAJOR==1 && LIBZIP_VERSION_MINOR>=7)
     #define LIBZIPPP_HAS_COMPRESSION_METHOD_SUPPORTED 1
+  #endif
+  //ZIP_SOURCE_SUPPORTS_REOPEN (allowing a staged entry to be read back before the
+  //commit) exists since libzip 1.10.0; older versions read changed entries without it
+  #if LIBZIP_VERSION_MAJOR>1 || (LIBZIP_VERSION_MAJOR==1 && LIBZIP_VERSION_MINOR>=10)
+    #define LIBZIPPP_HAS_SOURCE_SUPPORTS_REOPEN 1
   #endif
 #endif
 
@@ -1329,6 +1335,179 @@ bool ZipArchive::addData(const string& entryName, const void* data, libzippp_uin
         adoptedBuffers.push_back(const_cast<void*>(data));
     }
     return true;
+}
+
+/*
+ * Spooled content of a stream addition (see ZipArchive::addData(entryName, istream&)).
+ * The whole content lives in a temporary file created by tmpfile(): it is deleted
+ * automatically when the file is closed, and the file is closed exactly once, when
+ * libzip frees the source (ZIP_SOURCE_FREE) — i.e. when the changes are committed,
+ * discarded, rolled back or replaced by a later addition. The source is a callback
+ * source (zip_source_function) rather than a file source so that it can advertise
+ * ZIP_SOURCE_SUPPORTS_REOPEN, which is what allows the staged entry to be read back
+ * (Current state) before the changes are committed.
+ */
+struct StreamSpool {
+    FILE* file;
+    zip_uint64_t size;
+    zip_uint64_t offset;
+};
+
+static zip_int64_t streamSpoolSourceCallback(void* ud, void* data, zip_uint64_t len, zip_source_cmd_t cmd) {
+    StreamSpool* spool = static_cast<StreamSpool*>(ud);
+    switch (cmd) {
+        case ZIP_SOURCE_OPEN:
+            //reading a staged entry (and the commit itself) always starts from the beginning
+            if (fseek(spool->file, 0, SEEK_SET)!=0) { return -1; }
+            spool->offset = 0;
+            return 0;
+        case ZIP_SOURCE_READ: {
+            size_t got = fread(data, 1, (size_t)len, spool->file);
+            spool->offset += got;
+            return (zip_int64_t)got;
+        }
+        case ZIP_SOURCE_CLOSE:
+            return 0;
+        case ZIP_SOURCE_STAT: {
+            zip_stat_t* st = static_cast<zip_stat_t*>(data);
+            zip_stat_init(st);
+            st->size = spool->size;
+            st->valid |= ZIP_STAT_SIZE;
+            return (zip_int64_t)sizeof(zip_stat_t);
+        }
+        case ZIP_SOURCE_ERROR: {
+            int* err = static_cast<int*>(data);
+            err[0] = ZIP_ER_OK;
+            err[1] = 0;
+            return (zip_int64_t)(sizeof(int)*2);
+        }
+        case ZIP_SOURCE_FREE:
+            fclose(spool->file); //tmpfile: closing also deletes the temporary file
+            delete spool;
+            return 0;
+        case ZIP_SOURCE_SEEK: {
+            zip_source_args_seek_t* args = static_cast<zip_source_args_seek_t*>(data);
+            zip_int64_t newOffset;
+            if (args->whence==SEEK_SET) { newOffset = args->offset; }
+            else if (args->whence==SEEK_CUR) { newOffset = (zip_int64_t)spool->offset + args->offset; }
+            else if (args->whence==SEEK_END) { newOffset = (zip_int64_t)spool->size + args->offset; }
+            else { return -1; }
+            if (newOffset<0 || (zip_uint64_t)newOffset>spool->size) { return -1; }
+            if (fseek(spool->file, (long)newOffset, SEEK_SET)!=0) { return -1; }
+            spool->offset = (zip_uint64_t)newOffset;
+            return 0;
+        }
+        case ZIP_SOURCE_TELL:
+            return (zip_int64_t)spool->offset;
+        case ZIP_SOURCE_SUPPORTS: {
+            zip_int64_t bitmap = zip_source_make_command_bitmap(ZIP_SOURCE_OPEN, ZIP_SOURCE_READ, ZIP_SOURCE_CLOSE,
+                                                                ZIP_SOURCE_STAT, ZIP_SOURCE_ERROR, ZIP_SOURCE_FREE,
+                                                                ZIP_SOURCE_SEEK, ZIP_SOURCE_TELL, -1);
+#ifdef LIBZIPPP_HAS_SOURCE_SUPPORTS_REOPEN
+            //reading the staged entry back (Current state) before the commit
+            bitmap |= ZIP_SOURCE_MAKE_COMMAND_BITMASK(ZIP_SOURCE_SUPPORTS_REOPEN);
+#endif
+            return bitmap;
+        }
+        default:
+            return -1;
+    }
+}
+
+bool ZipArchive::addData(const string& entryName, std::istream& input) const {
+    if (!isOpen()) { return false; }
+    if (mode==ReadOnly) { return false; } //adding not allowed
+    if (entryName.empty()) { return false; }
+    if (LIBZIPPP_ENTRY_IS_DIRECTORY(entryName)) { return false; }
+
+    //see addFile: the selected compression/encryption must be applicable beforehand.
+    //Every rejection above happens before a single byte is consumed from the stream.
+    if (!isArchiveCompressionApplicable()) { return false; }
+    if (!isArchiveEncryptionApplicable()) { return false; }
+
+    /*
+     * The stream is fully consumed here, once, from its current position to its normal
+     * end, without knowing the length in advance and without seeking: the content is
+     * spooled into a temporary file through a fixed-size chunk buffer, so the memory
+     * used by this method does not depend on the size of the content. The temporary
+     * file is then wrapped in a callback source (see StreamSpool) owned by libzip:
+     * the staged content therefore never depends on the stream once this method has
+     * returned, and no resource outlives the opening it was staged in.
+     */
+    FILE* spoolFile = tmpfile();
+    if (spoolFile==nullptr) { return false; }
+
+    char* chunk = NEW_CHAR_ARRAY(LIBZIPPP_DEFAULT_CHUNK_SIZE)
+    if (chunk==nullptr) {
+        fclose(spoolFile); //also deletes the temporary file
+        return false;
+    }
+
+    /*
+     * A stream throwing at its normal end (an exception mask including eofbit or
+     * failbit) is still treated as fully read; any other read error or exception, and
+     * any failure to save the bytes already read, makes the addition fail. The
+     * exception is never propagated to the caller, the stream is never closed and its
+     * exception mask is never touched; the bytes already consumed are not pushed back.
+     */
+    bool spooled = true;
+    zip_uint64_t spoolSize = 0;
+    try {
+        for (;;) {
+            input.read(chunk, LIBZIPPP_DEFAULT_CHUNK_SIZE);
+            streamsize got = input.gcount();
+            if (got>0 && fwrite(chunk, 1, (size_t)got, spoolFile)!=(size_t)got) { spooled = false; break; }
+            spoolSize += (zip_uint64_t)got;
+            if (input.eof()) { break; }
+            if (input.fail() || input.bad()) { spooled = false; break; }
+        }
+    } catch (...) {
+        //the exception may have been raised after a partial extraction: gcount() still
+        //reports those bytes, which are part of the content and are spooled before the
+        //stream state is examined
+        streamsize got = input.gcount();
+        if (got>0 && fwrite(chunk, 1, (size_t)got, spoolFile)!=(size_t)got) { spooled = false; }
+        spoolSize += (zip_uint64_t)got;
+        if (!input.eof() || input.bad()) { spooled = false; }
+    }
+    delete[] chunk;
+
+    if (!spooled || fflush(spoolFile)!=0) {
+        fclose(spoolFile); //also deletes the temporary file
+        return false;
+    }
+
+    //the archive is only modified once the whole content has been safely spooled
+    vector<libzippp_uint64> createdDirIndices;
+    if (!createParentDirectories(entryName, createdDirIndices)) {
+        fclose(spoolFile);
+        return false;
+    }
+
+    /*
+     * The temporary file is wrapped in a callback source: libzip owns the StreamSpool
+     * from now on and releases it exactly once (ZIP_SOURCE_FREE closes the file, which
+     * also deletes it) when the changes are committed, discarded, rolled back or
+     * replaced by a later addition.
+     */
+    StreamSpool* spool = new (std::nothrow) StreamSpool();
+    if (spool==nullptr) {
+        fclose(spoolFile);
+        rollbackCreatedDirectories(createdDirIndices);
+        return false;
+    }
+    spool->file = spoolFile;
+    spool->size = spoolSize;
+    spool->offset = 0;
+
+    zip_source* source = zip_source_function(zipHandle, streamSpoolSourceCallback, spool);
+    if (source==nullptr) {
+        fclose(spoolFile);
+        delete spool;
+        rollbackCreatedDirectories(createdDirIndices);
+        return false;
+    }
+    return installPreparedSource(entryName, source, createdDirIndices);
 }
 
 bool ZipArchive::addData(const std::string& entryName, const std::basic_string<libzippp_uint8> data) const {
