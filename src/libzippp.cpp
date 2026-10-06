@@ -1703,7 +1703,15 @@ CompressionMethod ZipArchive::getCompressionMethod(void) const {
 int ZipArchive::readEntry(const ZipEntry& zipEntry, std::ostream& ofOutput, State state, libzippp_uint64 chunksize) const {
     if (!ofOutput) { return LIBZIPPP_ERROR_INVALID_PARAMETER; }
     std::function<bool(const void*,libzippp_uint64)> writeFunc = [&ofOutput](const void* data,libzippp_uint64 size){ ofOutput.write((char*)data, size); return bool(ofOutput); };
-    return readEntry(zipEntry, writeFunc, state, chunksize);
+    try {
+        return readEntry(zipEntry, writeFunc, state, chunksize);
+    } catch (const std::ios_base::failure&) {
+        //a write that failed through the stream's own exception mask is reported as an
+        //output write failure: the read has already been ended cleanly and the stream
+        //(its state and its exception mask) is left exactly as the failure left it
+        return LIBZIPPP_ERROR_OWRITE_FAILURE;
+    }
+    //any other exception thrown by the stream propagates to the caller unchanged
 }
 
 int ZipArchive::readEntry(const ZipEntry& zipEntry, std::function<bool(const void*,libzippp_uint64)> writeFunc, State state, libzippp_uint64 chunksize) const {
@@ -1729,12 +1737,17 @@ int ZipArchive::readEntry(const ZipEntry& zipEntry, std::function<bool(const voi
     //an empty content succeeds without reading anything; a single zero-length delivery is
     //still signalled to the output (this matches the historical behavior)
     if (maxSize==0) {
-        if (!writeFunc("", 0)) {
+        bool delivered = false;
+        try {
+            delivered = writeFunc("", 0);
+        } catch (...) {
+            //an output that throws still ends the read cleanly before the
+            //exception is propagated unchanged to the caller
             zip_fclose(zipFile);
-            return LIBZIPPP_ERROR_OWRITE_FAILURE;
+            throw;
         }
         zip_fclose(zipFile);
-        return LIBZIPPP_OK;
+        return delivered ? LIBZIPPP_OK : LIBZIPPP_ERROR_OWRITE_FAILURE;
     }
 
     //only allocate what a single delivery may need (the whole content when it is smaller
@@ -1757,7 +1770,18 @@ int ZipArchive::readEntry(const ZipEntry& zipEntry, std::function<bool(const voi
                 iRes = LIBZIPPP_ERROR_OWRITE_INDEX_FAILURE;
                 break;
             }
-            if (!writeFunc(data, toRead)) {
+            bool delivered = false;
+            try {
+                delivered = writeFunc(data, toRead);
+            } catch (...) {
+                //an output that throws ends the read here: release the chunk buffer and
+                //close the entry before the exception is propagated unchanged (no
+                //further chunk is delivered to the failing output)
+                delete[] data;
+                zip_fclose(zipFile);
+                throw;
+            }
+            if (!delivered) {
                 iRes = LIBZIPPP_ERROR_OWRITE_FAILURE;
                 break;
             }
