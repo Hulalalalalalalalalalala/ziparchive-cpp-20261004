@@ -462,6 +462,10 @@ namespace libzippp {
          * return the exact amount of requested bytes and -9 if the amount of extracted bytes didn't match the size of the file (unknown error).
          * If the provided chunk size is zero, it will be defaulted to LIBZIPPP_DEFAULT_CHUNK_SIZE (512KB).
          * The method doesn't close the ofstream after the extraction.
+         * If a write on the stream fails (failure state set, or std::ios_base::failure thrown because exceptions
+         * are enabled on the stream), the extraction stops and LIBZIPPP_ERROR_OWRITE_FAILURE is returned; the
+         * stream state and its exception mask are left as the write left them. Any other exception thrown by
+         * the stream is propagated to the caller unchanged, after the reading resources have been released.
          */
         int readEntry(const ZipEntry& zipEntry, std::ostream& ofOutput, State state=Current, libzippp_uint64 chunksize=LIBZIPPP_DEFAULT_CHUNK_SIZE) const;
         
@@ -476,6 +480,10 @@ namespace libzippp {
          * return the exact amount of requested bytes and -9 if the amount of extracted bytes didn't match the size of the file (unknown error).
          * If the provided chunk size is zero, it will be defaulted to LIBZIPPP_DEFAULT_CHUNK_SIZE (512KB).
          * The method doesn't close the ofstream after the extraction.
+         * If the output function returns false, the extraction stops and LIBZIPPP_ERROR_OWRITE_FAILURE is
+         * returned; the function is not invoked again afterwards. Any exception thrown by the output function
+         * (including std::ios_base::failure) is propagated to the caller unchanged, after the reading
+         * resources have been released.
          */
         int readEntry(const ZipEntry& zipEntry, std::function<bool(const void*,libzippp_uint64)> output, State state=Current, libzippp_uint64 chunksize=LIBZIPPP_DEFAULT_CHUNK_SIZE) const;
 
@@ -1036,6 +1044,10 @@ namespace libzippp {
          * return the exact amount of requested bytes and -9 if the amount of extracted bytes didn't match the size of the file (unknown error).
          * If the provided chunk size is zero, it will be defaulted to LIBZIPPP_DEFAULT_CHUNK_SIZE (512KB).
          * The method doesn't close the ofstream after the extraction.
+         * If a write on the stream fails (failure state set, or std::ios_base::failure thrown because exceptions
+         * are enabled on the stream), the extraction stops and LIBZIPPP_ERROR_OWRITE_FAILURE is returned; the
+         * stream state and its exception mask are left as the write left them. Any other exception thrown by
+         * the stream is propagated to the caller unchanged, after the reading resources have been released.
          */
         int readContent(std::ostream& ofOutput, ZipArchive::State state=ZipArchive::Current, libzippp_uint64 chunksize=LIBZIPPP_DEFAULT_CHUNK_SIZE) const;
 
