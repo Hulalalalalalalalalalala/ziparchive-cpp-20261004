@@ -1053,7 +1053,18 @@ int ZipArchive::deleteEntry(const ZipEntry& entry) const {
     if (!isEntryUsable(entry)) { return LIBZIPPP_ERROR_INVALID_ENTRY; }
     if (mode==ReadOnly) { return LIBZIPPP_ERROR_NOT_ALLOWED; } //deletion not allowed
 
-    if (entry.isFile()) {
+    /*
+     * Locate the entry through its (stable) libzip index, never through the name
+     * captured when the object was obtained: the entry may have been renamed or moved
+     * since (possibly several times) and its former name may now denote another entry
+     * that must not be touched. A slot without a name in the current state means the
+     * entry itself was deleted during this opening, whatever now occupies its old name.
+     */
+    const char* currentName = zip_get_name(zipHandle, entry.getIndex(), ZIP_FL_ENC_GUESS);
+    if (currentName==nullptr) { return LIBZIPPP_ERROR_INVALID_ENTRY; }
+    string entryName(currentName);
+
+    if (!LIBZIPPP_ENTRY_IS_DIRECTORY(entryName)) {
         int result = zip_delete(zipHandle, entry.getIndex());
         if (result==0) {
             forgetEntryCompressionConfig(entry.getIndex());
@@ -1067,7 +1078,7 @@ int ZipArchive::deleteEntry(const ZipEntry& entry) const {
         vector<ZipEntry>::const_iterator eit;
         for(eit=allEntries.begin() ; eit!=allEntries.end() ; ++eit) {
             ZipEntry ze = *eit;
-            string::size_type startPosition = ze.getName().find(entry.getName());
+            string::size_type startPosition = ze.getName().find(entryName);
             if (startPosition==0) {
                 int result = zip_delete(zipHandle, ze.getIndex());
                 if (result==0) {
@@ -1094,7 +1105,18 @@ int ZipArchive::renameEntry(const ZipEntry& entry, const string& newNameIn) cons
     if (mode==ReadOnly) { return LIBZIPPP_ERROR_NOT_ALLOWED; } //renaming not allowed
     if (newNameIn.length()==0) { return LIBZIPPP_ERROR_INVALID_PARAMETER; }
 
-    bool isDir = entry.isDirectory();
+    /*
+     * Resolve the entry through its (stable) libzip index, never through the name
+     * captured when the object was obtained: the entry may have been renamed or moved
+     * since (possibly several times) and its former name may now denote another entry
+     * that must not be touched. A slot without a name in the current state means the
+     * entry itself was deleted during this opening, whatever now occupies its old name.
+     */
+    const char* currentName = zip_get_name(zipHandle, entry.getIndex(), ZIP_FL_ENC_GUESS);
+    if (currentName==nullptr) { return LIBZIPPP_ERROR_INVALID_ENTRY; }
+    string sourceName(currentName);
+
+    bool isDir = LIBZIPPP_ENTRY_IS_DIRECTORY(sourceName);
     string newName = newNameIn;
     if (isDir) {
         //a '/' is automatically appended to the destination of a directory
@@ -1103,7 +1125,6 @@ int ZipArchive::renameEntry(const ZipEntry& entry, const string& newNameIn) cons
         if (LIBZIPPP_ENTRY_IS_DIRECTORY(newName)) { return LIBZIPPP_ERROR_INVALID_PARAMETER; } //a file cannot be renamed as a directory
     }
 
-    string sourceName = entry.getName();
     if (newName==sourceName) { return LIBZIPPP_ERROR_INVALID_PARAMETER; }
 
     /*

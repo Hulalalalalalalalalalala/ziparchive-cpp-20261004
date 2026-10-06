@@ -482,11 +482,19 @@ namespace libzippp {
         /**
          * Deletes the specified entry from the zip file. If the entry is a folder, all its
          * subentries will be removed. This method returns the number of entries removed.
-         * If the open mode does not allow a deletion, this method will return LIBZIPPP_ERROR_NOT_ALLOWED. 
-         * If the ZipArchive is not open, LIBZIPPP_ERROR_NOT_OPEN will be returned. If the entry is not handled 
+         * If the open mode does not allow a deletion, this method will return LIBZIPPP_ERROR_NOT_ALLOWED.
+         * If the ZipArchive is not open, LIBZIPPP_ERROR_NOT_OPEN will be returned. If the entry is not handled
          * by this ZipArchive or is a null-ZipEntry, then LIBZIPPP_ERROR_INVALID_ENTRY will be returned.
          * If an error occurs during deletion, this method will return LIBZIPPP_ERROR_UNKNOWN.
          * Note that this method does not affect the result returned by getNbEntries !
+         *
+         * The entry object identifies the entry itself (through its stable position in the
+         * archive), not the name it had when the object was obtained: if the entry has been
+         * renamed or moved since, the deletion applies to the entry wherever it currently is
+         * (for a folder, to its current content), and an unrelated entry that reused its
+         * former name is never touched. If the entry itself has already been deleted during
+         * this opening, LIBZIPPP_ERROR_INVALID_ENTRY is returned, even if its former name
+         * now belongs to another entry.
          */
         int deleteEntry(const ZipEntry& entry) const;
         
@@ -519,6 +527,15 @@ namespace libzippp {
          * directory below its own path is supported (e.g. a/ to a/b/).
          * If the ZipArchive is not open or the entry was not edited by this ZipArchive or is a null-ZipEntry,
          * then LIBZIPPP_ERROR_INVALID_ENTRY will be returned.
+         *
+         * The entry object identifies the entry itself (through its stable position in the
+         * archive), not the name it had when the object was obtained: if the entry has been
+         * renamed or moved since, the rename applies to the entry wherever it currently is
+         * (for a folder, to its current content), and an unrelated entry that reused its
+         * former name is never touched. Renaming to the name the entry currently has returns
+         * LIBZIPPP_ERROR_INVALID_PARAMETER. If the entry itself has already been deleted
+         * during this opening, LIBZIPPP_ERROR_INVALID_ENTRY is returned, even if its former
+         * name now belongs to another entry.
          */
         int renameEntry(const ZipEntry& entry, const std::string& newName) const;
 
