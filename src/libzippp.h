@@ -122,6 +122,7 @@ typedef void ErrorHandlerCallback(const std::string& message,
 namespace libzippp {
     class ZipEntry;
     class ZipProgressListener;
+    struct CommitContext;
 
     /**
      * Internal open-session marker. A new instance is created each time a ZipArchive is
@@ -238,6 +239,10 @@ namespace libzippp {
          * It is recommended to use ZipArchive::free instead of deleting directly the pointer
          * especially if the ZipArchive was created with the ZipArchive::fromSource or ZipArchive::fromBuffer
          * methods.
+         * A commit is still attempted, but an exception thrown by a progress listener never
+         * escapes the release: if the commit did not complete, the staged changes are
+         * abandoned and the original archive kept (as with discard); a completed commit
+         * always keeps its result. Registered listeners must outlive the ZipArchive.
          */
         virtual ~ZipArchive(void);
         
@@ -313,12 +318,30 @@ namespace libzippp {
          * Closes the ZipArchive and releases all the resources held by it. If the ZipArchive was
          * not open previously, this method does nothing. If the archive was open in modification
          * and some were done, they will be committed.
-         * This method returns LIBZIPPP_OK if the archive was successfully closed, otherwise it 
+         * This method returns LIBZIPPP_OK if the archive was successfully closed, otherwise it
          * returns a LIBZIPPP error code. The error is dispatched to ErrorHandlerCallback.
          * While being closed, all the registered ZipProgressListener instances will be invoked on
          * a regular basis, depending on the progression precision.
          * In some cases (when the archive is created with fromWritableBuffer), the archive is still
          * being closed, even if an error code is returned.
+         *
+         * A listener may abort the commit by throwing a C++ exception. Any exception thrown by a
+         * listener before the commit is finalized - the enforced initial zero notification, a
+         * progression update during the commit or a cancellation poll, even when the reported
+         * progression already reached 1 - aborts the commit: the archive stays open and usable,
+         * the existing archive file (or the writable buffer) is left byte-for-byte unchanged,
+         * every staged change is preserved, no listener is invoked afterwards and no final
+         * completion notification is sent. The first exception is rethrown to the caller with
+         * its original type and content. The same pending changes can then be committed by a
+         * further close() (after the failing listener has been removed or fixed) or abandoned
+         * with discard().
+         *
+         * The final completion notification (progression 1) is sent only once the committed
+         * result is available (the archive file committed and, for fromWritableBuffer, the
+         * buffer pointer and getBufferLength() length updated). If that notification - or the
+         * underlying final poll - throws, the exception is still rethrown but the committed
+         * result stands: the archive is closed, its entries have expired and a further close()
+         * neither recommits nor notifies again.
          */
         int close(void);
         
