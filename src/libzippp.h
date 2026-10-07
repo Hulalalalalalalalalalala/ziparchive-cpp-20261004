@@ -313,12 +313,22 @@ namespace libzippp {
          * Closes the ZipArchive and releases all the resources held by it. If the ZipArchive was
          * not open previously, this method does nothing. If the archive was open in modification
          * and some were done, they will be committed.
-         * This method returns LIBZIPPP_OK if the archive was successfully closed, otherwise it 
+         * This method returns LIBZIPPP_OK if the archive was successfully closed, otherwise it
          * returns a LIBZIPPP error code. The error is dispatched to ErrorHandlerCallback.
          * While being closed, all the registered ZipProgressListener instances will be invoked on
          * a regular basis, depending on the progression precision.
          * In some cases (when the archive is created with fromWritableBuffer), the archive is still
          * being closed, even if an error code is returned.
+         *
+         * If a ZipProgressListener throws a C++ exception while the commit is not complete,
+         * the commit is aborted: the archive is left open with all the pending changes
+         * preserved (a later close commits them, discard abandons them), no listener is
+         * invoked anymore during that close, the completion notification is not sent and
+         * the first thrown exception is rethrown as-is. The completion notification
+         * (progression value 1) is sent only once the commit result is available (the
+         * archive is written and, for fromWritableBuffer, the buffer pointer and length
+         * are updated): if it throws, the exception is rethrown but the committed result
+         * is kept and the archive is closed.
          */
         int close(void);
         
@@ -893,10 +903,19 @@ namespace libzippp {
     /**
      * Implementation of a progression listener that will be notified when the
      * ZipArchive is being closed and changes are being committed.
+     *
+     * A listener may throw a C++ exception to abort the commit: the exception is
+     * caught by libzippp (it never propagates through the C frames of libzip),
+     * the commit is cancelled like a regular cancellation and ZipArchive::close
+     * rethrows the first thrown exception once the archive is back in a
+     * consistent state. After a listener has thrown, no listener is invoked
+     * anymore during that close. An exception thrown while the ZipArchive is
+     * being destroyed never escapes the destruction: an incomplete commit is
+     * abandoned (as by discard) and a completed one is kept.
      */
     class LIBZIPPP_API ZipProgressListener {
     public:
-    
+
         /**
          * This method is invoked while the changes are being committed during
          * the closing of the ZipArchive.
@@ -909,12 +928,14 @@ namespace libzippp {
          * set in libzip.
          */
         virtual void progression(double p) = 0;
-        
+
         /**
          * This method is invoked during zip/unzip operations.
          * Define this function to be able to stop a long zip/unzip operation.
          * If this function return 1 the operation is cancelled.
          * If this function return 0 the operation will continue.
+         * Throwing a C++ exception cancels the operation as well; the exception
+         * is rethrown by ZipArchive::close.
          */
         virtual int cancel(void) = 0;
     };

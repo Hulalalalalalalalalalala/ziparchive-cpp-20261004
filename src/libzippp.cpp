@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <memory>
 
@@ -412,7 +413,15 @@ bool ZipArchive::isEntryUsable(const ZipEntry& entry) const {
 }
 
 ZipArchive::~ZipArchive(void) {
-    close(); /* discard ??? */
+    try {
+        close(); /* discard ??? */
+    } catch (...) {
+        //a listener exception must never escape the destruction: if the commit
+        //did not complete, the pending changes are abandoned and the original
+        //archive is kept; if it did complete, its result is kept and the
+        //archive is already closed
+        if (isOpen()) { discard(); }
+    }
 
     //if the commit failed in close(), the archive is gone anyway: the adopted buffers
     //must not outlive it (on a successful close/discard this is a no-op)
@@ -584,21 +593,55 @@ bool ZipArchive::open(OpenMode om, bool checkConsistency) {
     return false;
 }
 
+/*
+ * Per-close dispatch state shared by the progress callbacks. It carries the
+ * archive the listeners belong to and the first C++ exception a listener
+ * threw during this close, if any. A listener exception is always caught
+ * inside the callback (it must never propagate through the C frames of
+ * libzip), recorded here and rethrown by ZipArchive::close once the archive
+ * is back in a consistent state. While an exception is recorded, no listener
+ * is invoked anymore and the cancel callback systematically requests a
+ * cancellation, so libzip aborts the commit at the next opportunity and
+ * leaves the archive open with its pending changes untouched.
+ * The state lives on the stack of ZipArchive::close: a new close is never
+ * affected by an exception thrown during a previous one.
+ */
+struct ListenerDispatch {
+    ZipArchive* archive;
+    std::exception_ptr exception;
+};
+
 void progress_callback(zip* /*archive*/, double progression, void* ud) {
-    ZipArchive* za = static_cast<ZipArchive*>(ud);
-    vector<ZipProgressListener*> listeners = za->getProgressListeners();
+    ListenerDispatch* dispatch = static_cast<ListenerDispatch*>(ud);
+    if (dispatch->exception!=nullptr) { return; } //a listener already threw: no listener is called again
+    vector<ZipProgressListener*> listeners = dispatch->archive->getProgressListeners();
     for(vector<ZipProgressListener*>::const_iterator it=listeners.begin() ; it!=listeners.end() ; ++it) {
         ZipProgressListener* listener = *it;
-        listener->progression(progression);
+        try {
+            listener->progression(progression);
+        } catch (...) {
+            //only the first exception is recorded: it is the one close() rethrows
+            dispatch->exception = std::current_exception();
+            return; //the remaining listeners are not invoked
+        }
     }
 }
 
 int progress_cancel_callback(zip* /*archive*/, void* ud) {
-    ZipArchive* za = static_cast<ZipArchive*>(ud);
-    vector<ZipProgressListener*> listeners = za->getProgressListeners();
+    ListenerDispatch* dispatch = static_cast<ListenerDispatch*>(ud);
+    if (dispatch->exception!=nullptr) { return 1; } //abort the commit without calling any listener
+    vector<ZipProgressListener*> listeners = dispatch->archive->getProgressListeners();
     for(vector<ZipProgressListener*>::const_iterator it=listeners.begin() ; it!=listeners.end() ; ++it) {
         ZipProgressListener* listener = *it;
-        if (listener->cancel())
+        int cancelled;
+        try {
+            cancelled = listener->cancel();
+        } catch (...) {
+            //a throwing cancel() aborts the commit like a regular cancellation
+            dispatch->exception = std::current_exception();
+            return 1;
+        }
+        if (cancelled)
           return 1;
     }
     return 0;
@@ -610,14 +653,30 @@ int ZipArchive::close(void) {
         //do not handle zipSource at all because it will be deleted by libzip
         //directly when not necessary anymore
 
+        //per-close dispatch state: an exception thrown by a listener during a
+        //previous close never affects this one
+        ListenerDispatch dispatch;
+        dispatch.archive = this;
+        dispatch.exception = std::exception_ptr();
+
         if (!listeners.empty()) {
-            zip_register_progress_callback_with_state(zipHandle, progressPrecision, progress_callback, nullptr, this);
-            zip_register_cancel_callback_with_state(zipHandle, progress_cancel_callback, nullptr, this);
+            zip_register_progress_callback_with_state(zipHandle, progressPrecision, progress_callback, nullptr, &dispatch);
+            zip_register_cancel_callback_with_state(zipHandle, progress_cancel_callback, nullptr, &dispatch);
+        } else {
+            //a previous close may have registered callbacks bound to its own
+            //(now dead) dispatch state: make sure no stale registration remains
+            zip_register_progress_callback_with_state(zipHandle, 0, nullptr, nullptr, nullptr);
+            zip_register_cancel_callback_with_state(zipHandle, nullptr, nullptr, nullptr);
         }
 
         //avoid to reset the progress when unzipping
         if (mode != ReadOnly) {
-            progress_callback(zipHandle, 0, this); //enforce the first progression call to be zero
+            progress_callback(zipHandle, 0, &dispatch); //enforce the first progression call to be zero
+        }
+        if (dispatch.exception!=nullptr) {
+            //a listener threw during the initial notification: the commit has not
+            //started, the archive is left open and untouched
+            std::rethrow_exception(dispatch.exception);
         }
 
         int result = zip_close(zipHandle);
@@ -625,6 +684,12 @@ int ZipArchive::close(void) {
             //typically a cancelled commit: the archive is still open and usable, the
             //session is left untouched so existing entries and their copies remain valid
             Helper::callErrorHandlingCallback(zipHandle, "unable to close archive: %s\n", errorHandlingCallback);
+            if (dispatch.exception!=nullptr) {
+                //a listener aborted the commit by throwing: same situation as a
+                //cancellation (archive still open, pending changes preserved), but
+                //the first exception is rethrown to the caller
+                std::rethrow_exception(dispatch.exception);
+            }
             return LIBZIPPP_ERROR_HANDLE_FAILURE;
         }
 
@@ -639,7 +704,6 @@ int ZipArchive::close(void) {
         //(on a failed commit, e.g. a cancellation, they are kept so that a later
         //close can still commit the staged content)
         releaseStagedStreamFiles();
-        progress_callback(zipHandle, 1, this); //enforce the last progression call to be one
 
         //push back the changes in the buffer
         int res_code = LIBZIPPP_OK;
@@ -709,6 +773,21 @@ int ZipArchive::close(void) {
         }
 
         mode = NotOpen;
+
+        if (dispatch.exception!=nullptr) {
+            //a listener threw while the commit was completing (libzip gives no
+            //cancellation opportunity once the changes are written): the result
+            //is kept, the archive is closed, but the first exception is rethrown
+            std::rethrow_exception(dispatch.exception);
+        }
+        //the completion notification is enforced last, once the commit result is
+        //available (archive written, buffer pointer and length updated); a listener
+        //throwing here still leaves the committed result and the closed archive
+        //behind, and its exception is rethrown to the caller
+        progress_callback(zipHandle, 1, &dispatch); //enforce the last progression call to be one
+        if (dispatch.exception!=nullptr) {
+            std::rethrow_exception(dispatch.exception);
+        }
         return res_code;
     }
 

@@ -41,6 +41,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 
 #include "libzippp.h"
@@ -2273,6 +2274,597 @@ void test38() {
     cout << " done." << endl;
 }
 
+/*
+ * Exception contract of the progress listeners during the commit (close).
+ * A listener exception aborts an incomplete commit and is rethrown as-is by
+ * close() once the archive is back in a consistent state: the archive stays
+ * open with all the staged changes preserved, no listener is invoked anymore
+ * during that close and no completion notification is sent. The completion
+ * notification (progression 1) happens only once the commit result is
+ * available; if it throws, the result is kept and the archive is closed.
+ * During destruction a listener exception never escapes: an incomplete commit
+ * is abandoned, a completed one is kept.
+ */
+
+//custom exception type (not derived from std::exception) to verify that the
+//original type and content are preserved by the rethrow
+struct ListenerFailure {
+    string message;
+    explicit ListenerFailure(const string& m) : message(m) {}
+};
+
+class ThrowingProgressListener : public ZipProgressListener {
+public:
+    ThrowingProgressListener(void) : throwOnCall(0), throwOnCancelCall(0), throwAtOne(false), calls(0), cancelCalls(0), callsAfterThrow(0), threwBefore(false), completed(false), firstValue(-1), lastValue(-1) {}
+
+    int throwOnCall;        //1-based progression() call to throw on (0 = never)
+    int throwOnCancelCall;  //1-based cancel() call to throw on (0 = never)
+    bool throwAtOne;        //throw when progression(1) is received
+    int calls;
+    int cancelCalls;
+    int callsAfterThrow;    //invocations of this listener observed after its first throw
+    bool threwBefore;
+    bool completed;         //progression(1) observed
+    double firstValue;
+    double lastValue;
+
+    //restores a non-throwing behaviour so that a later close can commit
+    void disarm(void) { throwOnCall = 0; throwOnCancelCall = 0; throwAtOne = false; callsAfterThrow = 0; threwBefore = false; }
+
+    void progression(double p) {
+        if (threwBefore) { callsAfterThrow++; }
+        calls++;
+        if (firstValue<0) { firstValue = p; }
+        lastValue = p;
+        if (p==1) { completed = true; }
+        if (throwOnCall>0 && calls==throwOnCall) { threwBefore = true; throw ListenerFailure("progression failure"); }
+        if (throwAtOne && p==1) { threwBefore = true; throw ListenerFailure("completion failure"); }
+    }
+    int cancel() {
+        if (threwBefore) { callsAfterThrow++; }
+        cancelCalls++;
+        if (throwOnCancelCall>0 && cancelCalls==throwOnCancelCall) { threwBefore = true; throw ListenerFailure("cancel failure"); }
+        return 0;
+    }
+};
+
+class RuntimeThrowingListener : public ZipProgressListener {
+public:
+    RuntimeThrowingListener(void) : calls(0) {}
+    int calls;
+    void progression(double) { calls++; throw std::runtime_error("runtime boom"); }
+    int cancel() { return 0; }
+};
+
+static bool readWholeFile(const char* path, string& out) {
+    FILE* f = fopen(path, "rb");
+    if (f==nullptr) { return false; }
+    out.clear();
+    char chunk[4096];
+    size_t n;
+    while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0) { out.append(chunk, n); }
+    fclose(f);
+    return true;
+}
+
+static bool fileExists(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (f==nullptr) { return false; }
+    fclose(f);
+    return true;
+}
+
+void test39() {
+    cout << "Running test 39...";
+
+    //a listener throwing on the very first (zero) notification aborts the close
+    //before the commit starts: the archive stays open with its pending changes,
+    //the entries remain usable and the target file is never created
+    {
+        ZipArchive z("test.zip");
+        z.open(ZipArchive::New);
+        assert(z.addData("a.txt", "AAAA", 4));
+        assert(z.addData("dir/b.txt", "BBBB", 4));
+        assert(z.setComment("staged comment"));
+        ZipEntry saved = z.getEntry("a.txt");
+
+        ThrowingProgressListener listener;
+        listener.throwOnCall = 1; //the enforced zero notification
+        z.addProgressListener(&listener);
+
+        bool caught = false;
+        try {
+            z.close();
+        } catch (const ListenerFailure& e) {
+            caught = true;
+            assert(e.message=="progression failure"); //original type and content
+        }
+        assert(caught);
+        assert(z.isOpen()); //the commit never started
+        assert(listener.calls==1 && listener.callsAfterThrow==0);
+        assert(!listener.completed); //no completion notification
+
+        //the staged changes are all preserved and readable
+        assert(saved.readAsText()=="AAAA");
+        assert(z.getEntry("dir/b.txt").readAsText()=="BBBB");
+        assert(z.getComment()=="staged comment");
+        assert(z.getEntry("a.txt", false, true, ZipArchive::Original).isNull()); //new entry: no original
+
+        //the target file was never created
+        assert(!fileExists("test.zip"));
+
+        //once the listener is fixed, the same changes can be committed
+        listener.disarm();
+        assert(z.close()==LIBZIPPP_OK);
+        assert(listener.firstValue==0 && listener.lastValue==1 && listener.completed);
+
+        ZipArchive r("test.zip");
+        r.open(ZipArchive::ReadOnly);
+        assert(r.getEntry("a.txt").readAsText()=="AAAA");
+        assert(r.getEntry("dir/b.txt").readAsText()=="BBBB");
+        assert(r.getComment()=="staged comment");
+        r.close();
+        r.unlink();
+    }
+
+    //a listener throwing in the middle of the commit aborts it: the pre-existing
+    //archive is left byte-identical and every kind of staged change (addition,
+    //replacement, deletion, rename, comment) is preserved for a later close
+    {
+        {
+            ZipArchive w("test.zip");
+            w.open(ZipArchive::New);
+            assert(w.addData("keep.txt", "KEEP", 4));
+            assert(w.addData("replace.txt", "OLD", 3));
+            assert(w.addData("delete.txt", "DEL", 3));
+            assert(w.addData("rename.txt", "REN", 3));
+            assert(w.setComment("original comment"));
+            assert(w.close()==LIBZIPPP_OK);
+        }
+        string before;
+        assert(readWholeFile("test.zip", before));
+
+        ZipArchive z("test.zip");
+        z.open(ZipArchive::Write);
+        assert(z.addData("added.txt", "ADDED", 5));
+        assert(z.addData("replace.txt", "NEW", 3));
+        assert(z.deleteEntry("delete.txt")==1);
+        assert(z.renameEntry("rename.txt", "renamed.txt")==1);
+        assert(z.setComment("modified comment"));
+        ZipEntry saved = z.getEntry("replace.txt");
+
+        ThrowingProgressListener listener;
+        z.setProgressPrecision(0.01); //ensure intermediate progression notifications
+        listener.throwOnCall = 3; //deep inside the commit
+        z.addProgressListener(&listener);
+
+        bool caught = false;
+        try { z.close(); }
+        catch (const ListenerFailure& e) { caught = true; assert(e.message=="progression failure"); }
+        assert(caught);
+        assert(z.isOpen());
+        assert(listener.calls==3 && listener.callsAfterThrow==0 && !listener.completed);
+
+        //the archive on disk is byte-identical
+        string after;
+        assert(readWholeFile("test.zip", after));
+        assert(after==before);
+
+        //Current and Original still reflect the staged modifications and the
+        //opening state respectively
+        assert(saved.readAsText()=="NEW");
+        assert(saved.readAsText(ZipArchive::Original)=="OLD");
+        assert(z.hasEntry("added.txt"));
+        assert(!z.hasEntry("delete.txt"));
+        assert(z.getEntry("delete.txt", false, true, ZipArchive::Original).readAsText(ZipArchive::Original)=="DEL");
+        assert(z.hasEntry("renamed.txt") && !z.hasEntry("rename.txt"));
+        assert(z.getEntry("rename.txt", false, true, ZipArchive::Original).readAsText(ZipArchive::Original)=="REN");
+        assert(z.getComment()=="modified comment");
+        assert(z.getComment(ZipArchive::Original)=="original comment");
+
+        //a new close is not affected by the previous exception and commits everything
+        listener.disarm();
+        assert(z.close()==LIBZIPPP_OK);
+        assert(listener.firstValue==0 && listener.lastValue==1 && listener.completed);
+
+        ZipArchive r("test.zip");
+        r.open(ZipArchive::ReadOnly);
+        assert(r.getEntry("keep.txt").readAsText()=="KEEP");
+        assert(r.getEntry("added.txt").readAsText()=="ADDED");
+        assert(r.getEntry("replace.txt").readAsText()=="NEW");
+        assert(!r.hasEntry("delete.txt"));
+        assert(r.getEntry("renamed.txt").readAsText()=="REN");
+        assert(r.getComment()=="modified comment");
+        r.close();
+        r.unlink();
+    }
+
+    //a listener throwing from cancel() aborts the commit the same way
+    {
+        ZipArchive z("test.zip");
+        z.open(ZipArchive::New);
+        assert(z.addData("c.txt", "CCCC", 4));
+
+        ThrowingProgressListener listener;
+        listener.throwOnCancelCall = 1;
+        z.addProgressListener(&listener);
+
+        bool caught = false;
+        try { z.close(); }
+        catch (const ListenerFailure& e) { caught = true; assert(e.message=="cancel failure"); }
+        assert(caught);
+        assert(z.isOpen());
+        assert(listener.cancelCalls==1 && listener.callsAfterThrow==0 && !listener.completed);
+
+        listener.disarm();
+        assert(z.close()==LIBZIPPP_OK);
+
+        ZipArchive r("test.zip");
+        r.open(ZipArchive::ReadOnly);
+        assert(r.getEntry("c.txt").readAsText()=="CCCC");
+        r.close();
+        r.unlink();
+    }
+
+    //the first exception is the one rethrown; once a listener has thrown, no
+    //listener is invoked anymore during that close
+    {
+        ZipArchive z("test.zip");
+        z.open(ZipArchive::New);
+        assert(z.addData("d.txt", "DDDD", 4));
+
+        ThrowingProgressListener first;
+        first.throwOnCall = 1;
+        RuntimeThrowingListener second; //would throw a std::runtime_error if reached
+        z.addProgressListener(&first);
+        z.addProgressListener(&second);
+
+        bool caught = false;
+        try { z.close(); }
+        catch (const ListenerFailure& e) { caught = true; assert(e.message=="progression failure"); }
+        assert(caught); //a rethrown runtime_error would not be caught here
+        assert(first.calls==1);
+        assert(second.calls==0); //never invoked
+        assert(z.isOpen());
+
+        z.removeProgressListener(&first);
+        z.removeProgressListener(&second);
+        assert(z.close()==LIBZIPPP_OK);
+        z.unlink();
+    }
+
+    //a standard exception is rethrown with its dynamic type and content
+    {
+        ZipArchive z("test.zip");
+        z.open(ZipArchive::New);
+        assert(z.addData("k.txt", "KKKK", 4));
+
+        RuntimeThrowingListener listener;
+        z.addProgressListener(&listener);
+
+        bool caught = false;
+        try { z.close(); }
+        catch (const std::runtime_error& e) { caught = true; assert(string(e.what())=="runtime boom"); }
+        assert(caught);
+        assert(z.isOpen());
+
+        z.removeProgressListener(&listener);
+        assert(z.close()==LIBZIPPP_OK);
+        z.unlink();
+    }
+
+    //even when the underlying layer reports a progression of 1, an exception
+    //aborts the commit as long as it is not complete: no half-written archive
+    //is left behind
+    {
+        string big(16384, 'x'); //two full libzip buffers: 1 is reported while copying
+        ZipArchive z("test.zip");
+        z.open(ZipArchive::New);
+        z.setCompressionMethod(CompressionMethod::STORE); //no compression: the source is read in full chunks
+        assert(z.addData("big.bin", big.data(), (libzippp_uint64)big.size()));
+
+        ThrowingProgressListener listener;
+        listener.throwAtOne = true;
+        z.addProgressListener(&listener);
+
+        bool caught = false;
+        try { z.close(); }
+        catch (const ListenerFailure& e) { caught = true; assert(e.message=="completion failure"); }
+        assert(caught);
+        assert(listener.completed); //progression 1 was indeed reported...
+        assert(z.isOpen());         //...but the commit was aborted anyway
+        assert(!fileExists("test.zip")); //no half-written archive remains
+
+        listener.disarm();
+        assert(z.close()==LIBZIPPP_OK);
+
+        ZipArchive r("test.zip");
+        r.open(ZipArchive::ReadOnly);
+        assert(r.getEntry("big.bin").readAsText()==big);
+        r.close();
+        r.unlink();
+    }
+
+    //the completion notification happens once the commit result is available:
+    //if it throws, close rethrows but the result is kept, the archive is closed
+    //and a later close neither re-commits nor re-notifies
+    {
+        ZipArchive z("test.zip");
+        z.open(ZipArchive::New);
+        assert(z.addData("f.txt", "FFFF", 4));
+        ZipEntry saved = z.getEntry("f.txt");
+
+        ThrowingProgressListener listener;
+        listener.throwAtOne = true; //small entries: 1 is only reported after the commit
+        z.addProgressListener(&listener);
+
+        bool caught = false;
+        try { z.close(); }
+        catch (const ListenerFailure& e) { caught = true; assert(e.message=="completion failure"); }
+        assert(caught);
+        assert(!z.isOpen()); //the commit completed: the archive is closed
+        assert(saved.readAsText().empty()); //the entries of the opening expired
+
+        int callsAfterClose = listener.calls;
+        assert(z.close()==LIBZIPPP_OK); //no re-commit, no re-notification
+        assert(listener.calls==callsAfterClose);
+
+        ZipArchive r("test.zip");
+        r.open(ZipArchive::ReadOnly);
+        assert(r.getEntry("f.txt").readAsText()=="FFFF"); //the result is kept
+        r.close();
+        r.unlink();
+    }
+
+    //for a writable buffer, an aborted close leaves the pointer, the content and
+    //the length untouched, and the completion notification happens only after
+    //the buffer pointer and getBufferLength() have been updated
+    {
+        //build an initial archive in memory
+        void* buffer = calloc(4096, sizeof(char)); //must be malloc/calloc for fromWritableBuffer
+        ZipArchive* z1 = ZipArchive::fromWritableBuffer(&buffer, 4096, ZipArchive::New);
+        assert(z1 != nullptr);
+        assert(z1->addData("g.txt", "GGGG", 4));
+        assert(z1->close()==LIBZIPPP_OK);
+        libzippp_uint32 len1 = (libzippp_uint32)z1->getBufferLength();
+        ZipArchive::free(z1);
+
+        //aborted close: the buffer is left exactly as it was
+        void* originalBuffer = buffer;
+        string originalContent((const char*)buffer, len1);
+
+        ZipArchive* z2 = ZipArchive::fromWritableBuffer(&buffer, len1, ZipArchive::Write);
+        assert(z2 != nullptr);
+        assert(z2->addData("g.txt", "REPLACED", 8));
+        assert(z2->addData("new.txt", "NEW", 3));
+
+        ThrowingProgressListener listener;
+        listener.throwOnCall = 1;
+        z2->addProgressListener(&listener);
+
+        bool caught = false;
+        try { z2->close(); }
+        catch (const ListenerFailure&) { caught = true; }
+        assert(caught);
+        assert(z2->isOpen());
+        assert(buffer==originalBuffer); //pointer untouched
+        assert(z2->getBufferLength()==len1); //length untouched
+        assert(memcmp(buffer, originalContent.data(), len1)==0); //content untouched
+
+        listener.disarm();
+        assert(z2->close()==LIBZIPPP_OK);
+        libzippp_uint32 len2 = (libzippp_uint32)z2->getBufferLength();
+        assert(buffer!=originalBuffer || len2!=len1); //the buffer was updated
+        ZipArchive::free(z2);
+
+        ZipArchive* z3 = ZipArchive::fromBuffer(buffer, len2, true);
+        assert(z3 != nullptr);
+        assert(z3->getEntry("g.txt").readAsText()=="REPLACED");
+        assert(z3->getEntry("new.txt").readAsText()=="NEW");
+        ZipArchive::free(z3);
+        free(buffer);
+    }
+
+    //the completion notification observes the updated buffer
+    {
+        void* buffer = calloc(4096, sizeof(char));
+        ZipArchive* z = ZipArchive::fromWritableBuffer(&buffer, 4096, ZipArchive::New);
+        assert(z != nullptr);
+        assert(z->addData("h.txt", "HHHH", 4));
+
+        //records whether the buffer was already updated when 1 was last reported
+        class BufferAwareListener : public ZipProgressListener {
+        public:
+            BufferAwareListener(void** slot, void* original, ZipArchive* archive) : bufferSlot(slot), originalBuffer(original), archive(archive), updatedAtCompletion(false), completed(false) {}
+            void** bufferSlot;
+            void* originalBuffer;
+            ZipArchive* archive;
+            bool updatedAtCompletion;
+            bool completed;
+            void progression(double p) {
+                if (p==1) {
+                    completed = true;
+                    updatedAtCompletion = (*bufferSlot!=originalBuffer && archive->getBufferLength()>0);
+                }
+            }
+            int cancel() { return 0; }
+        };
+        BufferAwareListener tracker(&buffer, buffer, z);
+        z->addProgressListener(&tracker);
+
+        assert(z->close()==LIBZIPPP_OK);
+        assert(tracker.completed && tracker.updatedAtCompletion);
+        ZipArchive::free(z);
+        free(buffer);
+    }
+
+    //a listener exception never escapes the destruction: an incomplete commit
+    //is abandoned (the original archive is kept), a completed one is kept
+    {
+        {
+            ZipArchive w("test.zip");
+            w.open(ZipArchive::New);
+            assert(w.addData("keep.txt", "KEEP", 4));
+            assert(w.close()==LIBZIPPP_OK);
+        }
+        string before;
+        assert(readWholeFile("test.zip", before));
+
+        //incomplete commit at scope exit: the staged changes are abandoned
+        {
+            ThrowingProgressListener listener;
+            listener.throwOnCall = 1;
+            {
+                ZipArchive z("test.zip");
+                z.open(ZipArchive::Write);
+                assert(z.addData("keep.txt", "CHANGED", 7));
+                assert(z.addData("new.txt", "NEW", 3));
+                z.addProgressListener(&listener);
+            } //~ZipArchive: close throws internally, caught, changes discarded
+            string after;
+            assert(readWholeFile("test.zip", after));
+            assert(after==before); //the original archive is kept
+        }
+
+        //same through ZipArchive::free
+        {
+            ThrowingProgressListener listener;
+            listener.throwOnCall = 1;
+            ZipArchive* z = new ZipArchive("test.zip");
+            z->open(ZipArchive::Write);
+            assert(z->addData("keep.txt", "CHANGED", 7));
+            z->addProgressListener(&listener);
+            ZipArchive::free(z); //no exception escapes
+            string after;
+            assert(readWholeFile("test.zip", after));
+            assert(after==before);
+        }
+
+        //completed commit at scope exit: the result is kept
+        {
+            ThrowingProgressListener listener;
+            listener.throwAtOne = true; //small entries: thrown after the commit completed
+            {
+                ZipArchive z("test.zip");
+                z.open(ZipArchive::Write);
+                assert(z.addData("keep.txt", "CHANGED", 7));
+                z.addProgressListener(&listener);
+            } //~ZipArchive: the commit completed, the exception is swallowed
+            ZipArchive r("test.zip");
+            r.open(ZipArchive::ReadOnly);
+            assert(r.getEntry("keep.txt").readAsText()=="CHANGED"); //the result is kept
+            r.close();
+        }
+        remove("test.zip");
+    }
+
+    //content staged from a stream can be committed by a later close even when
+    //the original stream is gone
+    {
+        ThrowingProgressListener listener;
+        listener.throwOnCall = 1;
+        ZipArchive z("test.zip");
+        z.open(ZipArchive::New);
+        istringstream* in = new istringstream("streamed content");
+        assert(z.addData("s/data.txt", *in));
+        z.addProgressListener(&listener);
+
+        bool caught = false;
+        try { z.close(); } catch (const ListenerFailure&) { caught = true; }
+        assert(caught);
+        assert(z.isOpen());
+        assert(z.getEntry("s/data.txt").readAsText()=="streamed content");
+
+        delete in; //the stream is destroyed before the commit
+        listener.disarm();
+        assert(z.close()==LIBZIPPP_OK);
+
+        ZipArchive r("test.zip");
+        r.open(ZipArchive::ReadOnly);
+        assert(r.getEntry("s/data.txt").readAsText()=="streamed content");
+        r.close();
+        r.unlink();
+    }
+
+    //after an aborting exception, discard abandons the staged changes
+    {
+        {
+            ZipArchive w("test.zip");
+            w.open(ZipArchive::New);
+            assert(w.addData("j.txt", "JJJJ", 4));
+            assert(w.close()==LIBZIPPP_OK);
+        }
+        string before;
+        assert(readWholeFile("test.zip", before));
+
+        ZipArchive z("test.zip");
+        z.open(ZipArchive::Write);
+        assert(z.addData("j.txt", "CHANGED", 7));
+        ThrowingProgressListener listener;
+        listener.throwOnCall = 1;
+        z.addProgressListener(&listener);
+
+        bool caught = false;
+        try { z.close(); } catch (const ListenerFailure&) { caught = true; }
+        assert(caught);
+        assert(z.isOpen());
+
+        z.discard(); //abandon the staged changes
+        assert(!z.isOpen());
+        string after;
+        assert(readWholeFile("test.zip", after));
+        assert(after==before);
+        z.unlink();
+    }
+
+    //a buffer adopted with freeData=true survives an aborted commit and is
+    //released exactly once, when a later close commits it
+    {
+        ZipArchive z("test.zip");
+        z.open(ZipArchive::New);
+        char* adopted = static_cast<char*>(malloc(5));
+        memcpy(adopted, "ADOPT", 5);
+        assert(z.addData("adopted.bin", adopted, 5, true)); //ownership transferred
+
+        ThrowingProgressListener listener;
+        listener.throwOnCall = 1;
+        z.addProgressListener(&listener);
+
+        bool caught = false;
+        try { z.close(); } catch (const ListenerFailure&) { caught = true; }
+        assert(caught);
+        assert(z.isOpen());
+        assert(z.getEntry("adopted.bin").readAsText()=="ADOPT"); //still staged
+
+        listener.disarm();
+        assert(z.close()==LIBZIPPP_OK); //the adopted buffer is released by the commit
+
+        ZipArchive r("test.zip");
+        r.open(ZipArchive::ReadOnly);
+        assert(r.getEntry("adopted.bin").readAsText()=="ADOPT");
+        r.close();
+        r.unlink();
+    }
+
+    //an adopted buffer is released exactly once when the destruction abandons
+    //an incomplete commit
+    {
+        ThrowingProgressListener listener;
+        listener.throwOnCall = 1;
+        {
+            ZipArchive z("test.zip");
+            z.open(ZipArchive::New);
+            char* adopted = static_cast<char*>(malloc(5));
+            memcpy(adopted, "ADOPT", 5);
+            assert(z.addData("adopted.bin", adopted, 5, true));
+            z.addProgressListener(&listener);
+        } //~ZipArchive: commit aborted, changes discarded, buffer released once
+        assert(!fileExists("test.zip"));
+    }
+
+    cout << " done." << endl;
+}
+
 int main() {
     test1();  test2();  test3();  test4();  test5();
     test6();  test7();  test8();  test9();  test10();
@@ -2281,7 +2873,7 @@ int main() {
     test21(); test22(); test23(); test23_2(); test24();
     test25(); test26(); test27(); test28(); test29();
     test30(); test31(); test32(); test33(); test34();
-    test35(); test36(); test37(); test38();
+    test35(); test36(); test37(); test38(); test39();
     return 0;
 }
 
